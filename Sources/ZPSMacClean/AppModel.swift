@@ -31,9 +31,8 @@ final class AppModel: ObservableObject {
         } else {
             let fm = FileManager.default
             let home = fm.homeDirectoryForCurrentUser
-            projectRoots = [URL(fileURLWithPath: "/Volumes/DATA/1 - ZENPOS"),
-                            home.appendingPathComponent("Projects"),
-                            home.appendingPathComponent("Developer")]
+            projectRoots = ["Projects", "Developer", "Code", "Sites"]
+                .map { home.appendingPathComponent($0) }
                 .filter { fm.fileExists(atPath: $0.path) }
         }
     }
