@@ -312,27 +312,37 @@ final class MediaModel: ObservableObject {
     private var lastRefresh = Date.distantPast
     private var refreshPending = false
 
+    /// Lọc và sắp xếp chạy trên hàng đợi riêng: với hàng chục nghìn dòng, làm trên luồng giao diện sẽ treo app.
+    nonisolated private static let sortQueue = DispatchQueue(label: "vn.zenpos.macclean.media-sort", qos: .userInitiated)
+    private var refreshGeneration = 0
+
     func refreshVisible() {
-        if isBusy, Date().timeIntervalSince(lastRefresh) < 1 {
+        if isBusy, Date().timeIntervalSince(lastRefresh) < 2 {
             guard !refreshPending else { return }
             refreshPending = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 self?.refreshPending = false
                 self?.refreshVisible()
             }
             return
         }
         lastRefresh = Date()
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let snapshot = rows
+        let filter = rowFilter
         let limit = Int64(largeMB) * 1_000_000
-        visibleRows = rows.filter { row in
-            switch rowFilter {
-            case .all: return true
-            case .large: return row.size >= limit
-            case .duplicates: return row.copies > 1
+        let order = sortOrder.first
+        Self.sortQueue.async {
+            let result = MediaRow.filterAndSort(snapshot, filter: filter, limit: limit, order: order)
+            Task { @MainActor [weak self] in
+                // Bỏ kết quả cũ nếu trong lúc đó đã có lượt lọc mới hơn.
+                guard let self, generation == self.refreshGeneration else { return }
+                self.visibleRows = result
+                // Danh sách ngắn lại sau khi lọc hoặc xoá thì không để trang hiện tại vượt quá trang cuối.
+                self.page = min(self.page, self.pageCount - 1)
             }
-        }.sorted(using: sortOrder)
-        // Danh sách ngắn lại sau khi lọc hoặc xoá thì không để trang hiện tại vượt quá trang cuối.
-        page = min(page, pageCount - 1)
+        }
     }
 
     var selectedRows: [MediaRow] { rows.filter { selection.contains($0.id) } }
@@ -1172,11 +1182,47 @@ struct MediaRow: Identifiable, Sendable {
     var group: String?
     var copies: Int
 
+    /// Tính sẵn một lần; tính lại trong mỗi phép so khi sắp xếp hàng chục nghìn dòng là rất chậm.
+    let name: String
+    let folder: String
+
+    init(file: MediaFile, width: Int, height: Int, group: String?, copies: Int) {
+        self.file = file
+        self.width = width
+        self.height = height
+        self.group = group
+        self.copies = copies
+        name = file.url.lastPathComponent
+        folder = file.url.deletingLastPathComponent().path
+    }
+
     var id: String { file.id }
-    var name: String { file.url.lastPathComponent }
-    var folder: String { file.url.deletingLastPathComponent().path }
     var size: Int64 { file.size }
     var pixels: Int { width * height }
+
+    /// So trực tiếp theo cột thay vì `sorted(using:)` của Foundation, vốn chậm vài giây với 70.000 dòng.
+    static func filterAndSort(_ rows: [MediaRow], filter: RowFilter, limit: Int64,
+                              order: KeyPathComparator<MediaRow>?) -> [MediaRow] {
+        var result = rows.filter { row in
+            switch filter {
+            case .all: return true
+            case .large: return row.size >= limit
+            case .duplicates: return row.copies > 1
+            }
+        }
+        let ascending = order?.order != .reverse
+        let key = order?.keyPath
+        func before(_ a: MediaRow, _ b: MediaRow) -> Bool {
+            switch key {
+            case \MediaRow.name: return a.name == b.name ? a.folder < b.folder : a.name < b.name
+            case \MediaRow.folder: return a.folder == b.folder ? a.name < b.name : a.folder < b.folder
+            case \MediaRow.pixels: return a.pixels == b.pixels ? a.size < b.size : a.pixels < b.pixels
+            default: return a.size == b.size ? a.name < b.name : a.size < b.size
+            }
+        }
+        result.sort { ascending ? before($0, $1) : before($1, $0) }
+        return result
+    }
 
     /// Đếm lại số bản trong nhóm sau khi có file bị chuyển đi.
     static func recount(_ rows: [MediaRow]) -> [MediaRow] {
