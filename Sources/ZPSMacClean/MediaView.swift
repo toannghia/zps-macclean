@@ -27,7 +27,17 @@ final class MediaModel: ObservableObject {
     @Published var notice: String?
 
     @Published var includeSimilar = true
-    @Published var duplicates: [DuplicateGroup] = []
+    @Published var duplicates: [DuplicateGroup] = [] { didSet { groupPage = min(groupPage, groupPageCount - 1) } }
+    /// Trang nhóm trùng đang xem, mỗi trang vài chục nhóm để danh sách hàng nghìn nhóm vẫn cuộn mượt.
+    @Published var groupPage = 0
+    let groupsPerPage = 50
+
+    var groupPageCount: Int { max(1, (duplicates.count + groupsPerPage - 1) / groupsPerPage) }
+
+    var pageGroups: ArraySlice<DuplicateGroup> {
+        let start = min(groupPage * groupsPerPage, duplicates.count)
+        return duplicates[start ..< min(start + groupsPerPage, duplicates.count)]
+    }
     /// Các file người dùng đã đánh dấu để chuyển vào Thùng rác.
     @Published var marked = Set<String>()
 
@@ -211,6 +221,7 @@ final class MediaModel: ObservableObject {
             }
             let stopped = model.stopFlag.isStopped
             await MainActor.run {
+                model.groupPage = 0
                 model.duplicates = groups
                 // Không chọn sẵn gì: chỉ file người dùng tự bấm chọn mới bị chuyển vào Thùng rác.
                 model.marked = []
@@ -688,39 +699,72 @@ struct MediaView: View {
         if model.duplicates.isEmpty {
             placeholder("Tìm ảnh và video trùng nhau", "Tìm xong không có file nào bị chọn sẵn. Bạn tự chọn bản cần xoá; file đã chọn vào Thùng rác, mỗi nhóm luôn giữ ít nhất một bản.")
         } else {
-            List(model.duplicates) { group in
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text(group.match == .exact ? "Giống hệt nhau" : "Nhìn giống nhau")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(group.match == .exact ? Risk.safe.color : Risk.review.color)
-                        Text("\(group.files.count) file").font(.caption).foregroundStyle(Brand.muted)
-                        Spacer()
-                        Text("Dọn được \(formatBytes(group.reclaimable))").font(.caption).foregroundStyle(Brand.muted)
-                        if group.files.contains(where: { model.marked.contains($0.id) }) {
-                            Button("Bỏ chọn") { model.unmark(group) }.font(.caption)
-                        }
-                        Button("Chọn bản thừa") { model.markExtras(in: group) }.font(.caption)
-                    }
-                    .buttonStyle(.link)
-                    ScrollView(.horizontal) {
-                        HStack(alignment: .top, spacing: 12) {
-                            ForEach(group.files) { file in
-                                DuplicateTile(file: file, isMarked: model.marked.contains(file.id),
-                                              isSuggested: file == group.suggestedKeep,
-                                              toggle: { model.toggle(file, in: group) },
-                                              preview: {
-                                                  PreviewController.shared.show(file.url, among: group.files.map(\.url))
-                                              })
-                            }
+            VStack(spacing: 0) {
+                // Chỉ một chiều cuộn: khung cuộn ngang lồng trong danh sách sẽ nuốt thao tác lăn chuột dọc.
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.pageGroups) { group in
+                            groupSection(group)
+                            Divider()
                         }
                     }
+                    .padding(.horizontal, 16)
                 }
-                .padding(.vertical, 6)
+                .id(model.groupPage)
+                groupPager
             }
-            .listStyle(.inset)
-            .scrollContentBackground(.hidden)
         }
+    }
+
+    private func groupSection(_ group: DuplicateGroup) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(group.match == .exact ? "Giống hệt nhau" : "Nhìn giống nhau")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(group.match == .exact ? Risk.safe.color : Risk.review.color)
+                Text("\(group.files.count) file").font(.caption).foregroundStyle(Brand.muted)
+                Spacer()
+                Text("Dọn được \(formatBytes(group.reclaimable))").font(.caption).foregroundStyle(Brand.muted)
+                if group.files.contains(where: { model.marked.contains($0.id) }) {
+                    Button("Bỏ chọn") { model.unmark(group) }.font(.caption)
+                }
+                Button("Chọn bản thừa") { model.markExtras(in: group) }.font(.caption)
+            }
+            .buttonStyle(.link)
+            // Lưới tự xuống dòng khi nhóm có nhiều file, thay cho cuộn ngang.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 190), alignment: .top)],
+                      alignment: .leading, spacing: 14) {
+                ForEach(group.files) { file in
+                    DuplicateTile(file: file, folder: relative(file.url.deletingLastPathComponent()),
+                                  isMarked: model.marked.contains(file.id),
+                                  isSuggested: file == group.suggestedKeep,
+                                  toggle: { model.toggle(file, in: group) },
+                                  preview: { PreviewController.shared.show(file.url, among: group.files.map(\.url)) })
+                }
+            }
+        }
+        .padding(.vertical, 12)
+    }
+
+    private var groupPager: some View {
+        HStack(spacing: 10) {
+            Button { model.groupPage = 0 } label: { Image(systemName: "chevron.left.2") }
+                .disabled(model.groupPage == 0)
+            Button { model.groupPage -= 1 } label: { Image(systemName: "chevron.left") }
+                .disabled(model.groupPage == 0)
+            Text("Trang \(model.groupPage + 1) / \(model.groupPageCount)").monospacedDigit().foregroundStyle(Brand.navy)
+            Button { model.groupPage += 1 } label: { Image(systemName: "chevron.right") }
+                .disabled(model.groupPage >= model.groupPageCount - 1)
+            Button { model.groupPage = model.groupPageCount - 1 } label: { Image(systemName: "chevron.right.2") }
+                .disabled(model.groupPage >= model.groupPageCount - 1)
+            Spacer()
+            let first = model.groupPage * model.groupsPerPage + 1
+            let last = min((model.groupPage + 1) * model.groupsPerPage, model.duplicates.count)
+            Text("Nhóm \(first)–\(last) trong \(model.duplicates.count)").foregroundStyle(Brand.muted).monospacedDigit()
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
     }
 
     @ViewBuilder private var compressionList: some View {
@@ -1053,8 +1097,9 @@ struct MediaView: View {
     }
 
     private func relative(_ url: URL) -> String {
-        guard let root = model.folder?.path, url.path.hasPrefix(root) else { return url.path }
-        return String(url.path.dropFirst(root.count + 1))
+        let path = url.standardizedFileURL.path
+        guard let root = model.folder?.standardizedFileURL.path, path.hasPrefix(root) else { return path }
+        return path.count > root.count ? String(path.dropFirst(root.count + 1)) : ""
     }
 }
 
@@ -1134,6 +1179,8 @@ private struct WorkProgressView: View {
 /// Một file trong nhóm trùng. Bấm ảnh chỉ để xem trước; muốn xoá phải tick ô riêng.
 private struct DuplicateTile: View {
     let file: MediaFile
+    /// Thư mục chứa file, tính từ thư mục đã chọn.
+    let folder: String
     let isMarked: Bool
     let isSuggested: Bool
     let toggle: () -> Void
@@ -1174,6 +1221,14 @@ private struct DuplicateTile: View {
                 .foregroundStyle(isMarked ? Brand.warning : Brand.slate)
             Text(file.url.lastPathComponent).font(.caption).foregroundStyle(Brand.navy).lineLimit(1)
                 .frame(width: 150, alignment: .leading).help(file.url.path)
+            Label(folder.isEmpty ? "(thư mục gốc)" : folder, systemImage: "folder")
+                .font(.caption2)
+                .foregroundStyle(Brand.slate)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(width: 150, alignment: .leading)
+                .help(file.url.deletingLastPathComponent().path)
+                .textSelection(.enabled)
             Text(formatBytes(file.size) + (isSuggested ? " · bản tốt nhất" : ""))
                 .font(.caption2).foregroundStyle(Brand.muted)
             Button("Hiện trong Finder") { NSWorkspace.shared.activateFileViewerSelecting([file.url]) }
