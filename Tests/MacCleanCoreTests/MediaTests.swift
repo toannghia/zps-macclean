@@ -263,4 +263,33 @@ final class MediaTests: XCTestCase {
         let all = Parallel.map(Array(0..<1000)) { $0 * 2 }
         XCTAssertEqual(all.compactMap { $0 }, (0..<1000).map { $0 * 2 })
     }
+
+    func testLargeFilesAreComparedBySamplesWithoutReadingEverything() throws {
+        let size = Int(DuplicateFinder.sampledThreshold) + 4 * 1024 * 1024
+        var data = Data(count: size)
+        for index in stride(from: 0, to: size, by: 4096) { data[index] = UInt8(truncatingIfNeeded: index / 4096) }
+        let a = root.appendingPathComponent("a.mov")
+        try data.write(to: a)
+        try FileManager.default.copyItem(at: a, to: root.appendingPathComponent("b.mov"))
+        // Bản thứ ba khác đúng một byte ở giữa, trúng vào một điểm lấy mẫu.
+        let middle = Int((UInt64(size) - UInt64(DuplicateFinder.fingerprintChunk)) * 15 / 31)
+        data[middle] ^= 0xFF
+        try data.write(to: root.appendingPathComponent("c.mov"))
+
+        let before = ProcessMonitor.memoryFootprint(getpid()) ?? 0
+        let groups = DuplicateFinder.find(files(), includeSimilar: false)
+        let after = ProcessMonitor.memoryFootprint(getpid()) ?? 0
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(Set(groups[0].files.map(\.url.lastPathComponent)), ["a.mov", "b.mov"])
+        XCTAssertLessThan(after - before, 100 * 1024 * 1024, "So file lớn không được làm bộ nhớ phình theo dung lượng file")
+    }
+
+    func testFullHashKeepsMemoryFlat() throws {
+        let url = root.appendingPathComponent("big.bin")
+        try Data(count: 200 * 1024 * 1024).write(to: url)
+        let before = ProcessMonitor.memoryFootprint(getpid()) ?? 0
+        XCTAssertNotNil(DuplicateFinder.sha256(url))
+        let after = ProcessMonitor.memoryFootprint(getpid()) ?? 0
+        XCTAssertLessThan(after - before, 50 * 1024 * 1024)
+    }
 }

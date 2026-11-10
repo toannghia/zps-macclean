@@ -149,7 +149,7 @@ public enum ProcessMonitor {
         return usage
     }
 
-    static func memoryFootprint(_ pid: Int32) -> Int64? {
+    public static func memoryFootprint(_ pid: Int32) -> Int64? {
         var info = rusage_info_v4()
         let result = withUnsafeMutablePointer(to: &info) { pointer in
             pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {

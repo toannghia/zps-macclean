@@ -7,7 +7,9 @@ public struct MediaFacts: Codable, Sendable {
     var width: Int?
     var height: Int?
     var fingerprint: String?
+    /// Bản cũ băm toàn bộ file; không dùng nữa để không trộn với mã so mẫu của file lớn.
     var fullHash: String?
+    var contentHash: String?
     var differenceHash: UInt64?
     var captureDate: TimeInterval?
 }
@@ -141,8 +143,8 @@ extension MediaIndex? {
     }
 
     func fullHash(_ file: MediaFile) -> String? {
-        guard let index = self else { return DuplicateFinder.sha256(file.url) }
-        return index.value(file, \.fullHash) { DuplicateFinder.sha256(file.url) }
+        guard let index = self else { return DuplicateFinder.contentHash(file) }
+        return index.value(file, \.contentHash) { DuplicateFinder.contentHash(file) }
     }
 
     func differenceHash(_ file: MediaFile) -> UInt64? {

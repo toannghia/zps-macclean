@@ -123,9 +123,12 @@ final class MediaModel: ObservableObject {
         stopped = false
         notice = nil
         progress = WorkProgress(phase: phase)
+        let watchdog = memoryWatchdog()
         Task.detached(priority: .userInitiated) { [self] in
             self.index.loadIfNeeded()
             await work(self)
+            watchdog.cancel()
+            let overLimit = await watchdog.value
             // Lưu cả khi bị dừng: phần đã đọc được dùng lại cho lần sau.
             if !self.stopFlag.isStopped, self.scannedFiles > 0 {
                 self.index.recordScan(of: folder, files: self.scannedFiles)
@@ -136,7 +139,29 @@ final class MediaModel: ObservableObject {
                 self.isBusy = false
                 self.lastScan = last
                 self.refreshVisible()
+                if let overLimit {
+                    self.stopped = true
+                    self.notice = "Đã tự dừng vì app dùng tới \(formatBytes(overLimit)) bộ nhớ, để máy không bị treo. Kết quả đến lúc dừng vẫn được giữ và lưu lại; bấm Quét lại để làm tiếp phần còn thiếu."
+                }
             }
+        }
+    }
+
+    /// Mức bộ nhớ tối đa cho một lượt quét: một phần tư RAM của máy, không quá 4 GB.
+    nonisolated static let memoryLimit = min(Int64(4) << 30, Int64(ProcessInfo.processInfo.physicalMemory) / 4)
+
+    /// Đo bộ nhớ của chính app mỗi giây; vượt ngưỡng thì dừng lượt quét và trả về mức đã dùng.
+    private func memoryWatchdog() -> Task<Int64?, Never> {
+        let stop = stopFlag
+        return Task.detached(priority: .utility) {
+            while !Task.isCancelled {
+                if let used = ProcessMonitor.memoryFootprint(getpid()), used > Self.memoryLimit {
+                    stop.stop()
+                    return used
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            return nil
         }
     }
 

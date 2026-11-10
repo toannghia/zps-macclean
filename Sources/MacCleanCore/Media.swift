@@ -31,27 +31,38 @@ public final class StopFlag: @unchecked Sendable {
 
 /// Chạy một việc trên mọi lõi CPU, giữ đúng thứ tự kết quả; mục chưa làm khi bị dừng là nil.
 public enum Parallel {
-    public static func map<T, R>(_ items: [T], stop: StopFlag? = nil, progress: ((Double) -> Void)? = nil,
-                                 _ transform: (T) -> R?) -> [R?] {
+    /// Số việc đọc đĩa chạy cùng lúc. Nhiều hơn không nhanh hơn mà chỉ tốn bộ nhớ, nhất là với ổ gắn ngoài.
+    public static let diskWidth = 4
+
+    /// `width` giới hạn số luồng chạy cùng lúc; mặc định dùng hết số lõi.
+    public static func map<T, R>(_ items: [T], stop: StopFlag? = nil, width: Int? = nil,
+                                 progress: ((Double) -> Void)? = nil, _ transform: (T) -> R?) -> [R?] {
         guard !items.isEmpty else { return [] }
         var results = [R?](repeating: nil, count: items.count)
-        let chunk = 32
-        let chunks = (items.count + chunk - 1) / chunk
+        let lanes = max(1, min(width ?? ProcessInfo.processInfo.activeProcessorCount, items.count))
         let lock = NSLock()
+        var next = 0
         var finished = 0
+        let step = max(1, items.count / 200)
         results.withUnsafeMutableBufferPointer { buffer in
             let output = buffer
-            DispatchQueue.concurrentPerform(iterations: chunks) { index in
-                guard stop?.isStopped != true else { return }
-                // Mỗi đợt ghi vào vùng chỉ số riêng nên không cần khoá khi ghi kết quả.
-                for item in index * chunk ..< min(items.count, (index + 1) * chunk) {
-                    output[item] = transform(items[item])
+            DispatchQueue.concurrentPerform(iterations: lanes) { _ in
+                while true {
+                    // Kiểm tra lệnh dừng trước mỗi file, để file lớn không giữ cả lô.
+                    guard stop?.isStopped != true else { return }
+                    lock.lock()
+                    let item = next
+                    next += 1
+                    lock.unlock()
+                    guard item < items.count else { return }
+                    // Giải phóng dữ liệu tạm của từng file ngay, không để dồn tới khi xong cả lượt.
+                    autoreleasepool { output[item] = transform(items[item]) }
+                    lock.lock()
+                    finished += 1
+                    let done = finished
+                    lock.unlock()
+                    if done % step == 0 || done == items.count { progress?(Double(done) / Double(items.count)) }
                 }
-                lock.lock()
-                finished += 1
-                let fraction = Double(finished) / Double(chunks)
-                lock.unlock()
-                progress?(fraction)
             }
         }
         return results
@@ -211,7 +222,7 @@ public enum DuplicateFinder {
             grouped.formUnion(group.files.map(\.id))
         }
         let images = files.filter { $0.kind == .image && (!grouped.contains($0.id) || representative[$0.id] != nil) }
-        let hashes = Parallel.map(images, stop: stop, progress: { progress(0.3 + 0.65 * $0, "Đang so sánh nội dung ảnh") }) {
+        let hashes = Parallel.map(images, stop: stop, width: Parallel.diskWidth, progress: { progress(0.3 + 0.65 * $0, "Đang so sánh nội dung ảnh") }) {
             index.differenceHash($0)
         }
         // Dừng giữa chừng vẫn so các ảnh đã đọc xong.
@@ -239,14 +250,18 @@ public enum DuplicateFinder {
                             progress: @escaping @Sendable (Double) -> Void) -> [DuplicateGroup] {
         let candidates = Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size).values
             .filter { $0.count > 1 }.flatMap { $0 }
-        let prints = Parallel.map(candidates, stop: stop, progress: { progress(0.7 * $0) }) { index.fingerprint($0) }
+        let prints = Parallel.map(candidates, stop: stop, width: Parallel.diskWidth, progress: { progress(0.7 * $0) }) {
+            index.fingerprint($0)
+        }
         let byPrint = Dictionary(grouping: zip(candidates, prints).compactMap { file, print in print.map { (file, $0) } },
                                  by: { "\($0.0.size):\($0.1)" })
             .values.map { $0.map(\.0) }.filter { $0.count > 1 }
 
         // File nhỏ đã được đọc trọn khi lấy dấu vân tay; file lớn mới cần băm lại toàn bộ cho chắc.
         let needFull = byPrint.filter { $0[0].size > Int64(fingerprintChunk * 2) }.flatMap { $0 }
-        let full = Parallel.map(needFull, stop: stop, progress: { progress(0.7 + 0.3 * $0) }) { index.fullHash($0) }
+        let full = Parallel.map(needFull, stop: stop, width: Parallel.diskWidth, progress: { progress(0.7 + 0.3 * $0) }) {
+            index.fullHash($0)
+        }
         let fullHash = Dictionary(uniqueKeysWithValues: zip(needFull.map(\.id), full).compactMap { id, hash in hash.map { (id, $0) } })
 
         var groups: [DuplicateGroup] = []
@@ -311,14 +326,44 @@ public enum DuplicateFinder {
             || stem.range(of: #"\scopy\s\d+$"#, options: .regularExpression) != nil
     }
 
+    /// File lớn hơn mức này được so bằng mẫu rải đều thay vì đọc hết.
+    static let sampledThreshold: Int64 = 256 * 1024 * 1024
+    static let sampleCount = 32
+
     static func sha256(_ url: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         var hasher = SHA256()
-        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
-            hasher.update(data: chunk)
+        while true {
+            // Mỗi đoạn 1 MB được giải phóng ngay sau khi băm, bộ nhớ không phình theo dung lượng file.
+            let more: Bool = autoreleasepool {
+                guard let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
+                hasher.update(data: chunk)
+                return true
+            }
+            if !more { break }
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Mã nội dung: file nhỏ băm toàn bộ; file lớn băm 32 đoạn 64 KB rải đều, chỉ đọc khoảng 2 MB.
+    static func contentHash(_ file: MediaFile) -> String? {
+        guard file.size > sampledThreshold else { return sha256(file.url) }
+        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        let span = UInt64(file.size) - UInt64(fingerprintChunk)
+        for sample in 0..<sampleCount {
+            let ok: Bool = autoreleasepool {
+                let offset = span * UInt64(sample) / UInt64(sampleCount - 1)
+                guard (try? handle.seek(toOffset: offset)) != nil,
+                      let data = try? handle.read(upToCount: fingerprintChunk) else { return false }
+                hasher.update(data: data)
+                return true
+            }
+            if !ok { return nil }
+        }
+        return "s" + hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// dHash: thu nhỏ còn 9x8 điểm xám, mỗi bit cho biết điểm bên trái sáng hơn điểm bên phải.

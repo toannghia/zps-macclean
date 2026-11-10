@@ -78,10 +78,10 @@ public enum Guides {
                                                             "maven.repo", "nuget.packages", "cargo.registry"].compactMap { byRule[$0] }),
             GuideSection(title: "Ảnh & Video", guides: [
                 ItemGuide(name: "Ảnh trùng",
-                          what: "Tìm file giống hệt nhau từng byte, và tuỳ chọn tìm ảnh nhìn giống nhau như bản đã nén lại hoặc đổi kích thước.",
+                          what: "Tìm file giống hệt nhau, và tuỳ chọn tìm ảnh nhìn giống nhau như bản đã nén lại hoặc đổi kích thước. File dưới 256 MB được so từng byte; file lớn hơn như video dài được so dung lượng cùng 32 đoạn rải đều khắp file, để không phải đọc hết hàng chục GB.",
                           ifDeleted: "File được chuyển vào Thùng rác, chưa mất cho tới khi đổ Thùng rác. Mỗi nhóm luôn giữ ít nhất một bản.",
                           restore: "Mở Thùng rác, chọn file rồi bấm Đưa trở lại.",
-                          advice: "Nhóm Giống hệt nhau xoá an toàn. Nhóm Nhìn giống nhau nên xem kỹ, vì ảnh chụp liên tiếp cũng có thể bị xếp chung."),
+                          advice: "App tự dừng quét nếu dùng quá nhiều bộ nhớ, kết quả đến lúc đó vẫn được giữ. Nhóm Giống hệt nhau xoá an toàn. Nhóm Nhìn giống nhau nên xem kỹ, vì ảnh chụp liên tiếp cũng có thể bị xếp chung."),
                 ItemGuide(name: "Nén ảnh",
                           what: "Lưu lại ảnh JPEG, HEIC ở chất lượng thấp hơn, tuỳ chọn thu nhỏ và đổi sang HEIC. Giữ thông tin EXIF như ngày chụp, vị trí. Không động tới RAW và GIF.",
                           ifDeleted: "Mặc định bản gốc giữ nguyên, bản nén nằm trong thư mục \"ZPS Đã nén\". Khi chọn ghi đè, bản gốc vào Thùng rác.",

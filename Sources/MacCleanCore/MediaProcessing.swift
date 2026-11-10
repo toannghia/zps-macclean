@@ -304,7 +304,7 @@ public enum PhotoOrganizer {
     public static func plan(_ files: [MediaFile], root: URL, scheme: OrganizeScheme, stop: StopFlag? = nil,
                             index: MediaIndex? = nil, progress: ((Double) -> Void)? = nil) -> [OrganizeMove] {
         // Đọc ngày chụp song song; file chưa đọc kịp khi bị dừng thì không đưa vào kế hoạch.
-        let dates = Parallel.map(files, stop: stop, progress: progress) { index.captureDate($0) }
+        let dates = Parallel.map(files, stop: stop, width: Parallel.diskWidth, progress: progress) { index.captureDate($0) }
         var reserved = Set<String>()
         var moves: [OrganizeMove] = []
         for (file, date) in zip(files, dates) {
