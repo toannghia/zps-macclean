@@ -437,15 +437,27 @@ final class MediaModel: ObservableObject {
     }
 
     /// Chọn các bản thừa trong mỗi nhóm trùng, giữ lại bản lớn nhất.
-    func selectExtraCopies() {
+    /// Bản giữ của từng nhóm trùng, tính trên cả nhóm: độ phân giải, rồi dung lượng, rồi tên không phải bản sao.
+    private func keepers() -> [String: String] {
         let grouped = Dictionary(grouping: rows.filter { $0.group != nil }, by: { $0.group! })
-        selection = Set(grouped.values.flatMap { members in
-            members.sorted { a, b in
+        return grouped.compactMapValues { members in
+            members.min { a, b in
                 if a.pixels != b.pixels { return a.pixels > b.pixels }
                 if a.size != b.size { return a.size > b.size }
                 return DuplicateFinder.isLessPreferred(b.file, a.file)
-            }.dropFirst().map(\.id)
-        })
+            }?.id
+        }
+    }
+
+    func selectExtraCopies() {
+        let keep = keepers()
+        selection = Set(rows.filter { row in row.group.map { keep[$0] != row.id } ?? false }.map(\.id))
+    }
+
+    /// Chỉ tick các dòng trên trang đang xem; bản giữ vẫn tính trên cả nhóm nên mỗi nhóm luôn còn bản tốt nhất.
+    func selectExtraCopiesOnPage() {
+        let keep = keepers()
+        selection.formUnion(pageRows.filter { row in row.group.map { keep[$0] != row.id } ?? false }.map(\.id))
     }
 
     func trashSelected() {
@@ -978,7 +990,8 @@ struct MediaView: View {
             .labelsHidden()
             .frame(width: 140)
             Spacer()
-            Button("Chọn bản thừa trong nhóm trùng") { model.selectExtraCopies() }
+            Button("Chọn bản thừa trên trang này") { model.selectExtraCopiesOnPage() }
+            Button("Chọn bản thừa mọi nhóm") { model.selectExtraCopies() }
             Button("Chọn cả trang") { model.selectPage() }
             Button("Chọn tất cả \(model.visibleRows.count) file") { model.selectAllVisible() }
             if !model.selection.isEmpty {
