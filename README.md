@@ -26,6 +26,13 @@ ZPS MacClean dọn rác do công cụ lập trình và công cụ AI để lại
 - Bản sao code-sign do Chrome và Brave để lại, file tạm hệ thống
 - Thư mục tái tạo được trong dự án lâu không đụng tới: `node_modules`, `.next`, `build`, `Pods`, `target`, `.venv` và các thư mục tương tự
 
+**Ảnh & Video** (trên thư mục bạn chọn, không đụng tới thư viện Photos)
+- Tìm ảnh và video trùng: giống hệt từng byte, hoặc nhìn giống nhau như bản đã nén lại, đổi cỡ. Mỗi nhóm luôn giữ bản tốt nhất, các bản khác vào Thùng rác.
+- Nén ảnh JPEG, HEIC: chỉnh chất lượng, thu nhỏ, đổi sang HEIC. Giữ EXIF như ngày chụp, vị trí.
+- Sắp xếp ảnh theo ngày chụp vào thư mục Năm / Tháng, có xem trước và hoàn tác.
+- Nén video bằng HEVC hoặc H.264, giữ ngày quay.
+- Mặc định bản nén nằm trong thư mục `ZPS Đã nén`, bản gốc giữ nguyên. Khi chọn ghi đè, bản gốc vào Thùng rác.
+
 **Quản lý tiến trình**
 - Xem RAM và CPU theo từng ứng dụng, cập nhật mỗi 3 giây
 - Tắt hoặc buộc tắt ứng dụng và tiến trình
@@ -41,8 +48,9 @@ ZPS MacClean dọn rác do công cụ lập trình và công cụ AI để lại
 - App liên quan đang chạy thì mục đó bị khoá. File đang mở và dữ liệu ghi trong 2 giờ gần nhất được giữ lại.
 - Không kiểm tra được file đang mở thì app dừng, không xoá gì.
 - Mọi lần xoá được ghi vào `~/Library/Logs/ZPS-MacClean/clean.log`.
+- Với ảnh và video: không bao giờ xoá hẳn, không bao giờ ghi đè file trùng tên, bản nén không nhỏ hơn thì bỏ đi.
 
-Các mục đã dọn bị xoá hẳn, không vào Thùng rác. Hãy đọc hướng dẫn của từng mục trước khi chọn. Phần mềm được cung cấp nguyên trạng, không kèm bảo hành.
+Các mục rác đã dọn bị xoá hẳn, không vào Thùng rác. Hãy đọc hướng dẫn của từng mục trước khi chọn. Phần mềm được cung cấp nguyên trạng, không kèm bảo hành.
 
 ## Cài đặt
 

@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showHelp = false
     @State private var showProcesses = false
+    @State private var showMedia = false
     @State private var columns = NavigationSplitViewVisibility.all
 
     var body: some View {
@@ -17,7 +18,9 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 250, ideal: 270)
         } detail: {
             VStack(spacing: 0) {
-                if showProcesses {
+                if showMedia {
+                    MediaView()
+                } else if showProcesses {
                     ProcessesView()
                 } else {
                     header
@@ -52,6 +55,7 @@ struct ContentView: View {
     private func open(_ item: CleanCategory?) {
         category = item
         showProcesses = false
+        showMedia = false
     }
 
     private var confirmTitle: String {
@@ -74,12 +78,21 @@ struct ContentView: View {
             }
             Section {
                 SidebarRow(title: "Tiến trình", symbol: "cpu", color: Brand.green, size: 0,
-                           isSelected: showProcesses) { showProcesses = true }
+                           isSelected: showProcesses) {
+                    showProcesses = true
+                    showMedia = false
+                }
+                SidebarRow(title: "Ảnh & Video", symbol: "photo.on.rectangle", color: Brand.teal, size: 0,
+                           isSelected: showMedia) {
+                    showMedia = true
+                    showProcesses = false
+        showMedia = false
+                }
                 SidebarRow(title: "Tất cả", symbol: "square.grid.2x2", color: Brand.navy,
-                           size: model.totalFound, isSelected: !showProcesses && category == nil) { open(nil) }
+                           size: model.totalFound, isSelected: !showProcesses && !showMedia && category == nil) { open(nil) }
                 ForEach(CleanCategory.allCases) { item in
                     SidebarRow(title: item.title, symbol: item.symbol, color: item.color,
-                               size: model.size(of: item), isSelected: !showProcesses && category == item) { open(item) }
+                               size: model.size(of: item), isSelected: !showProcesses && !showMedia && category == item) { open(item) }
                 }
             }
         }
