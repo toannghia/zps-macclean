@@ -1,6 +1,5 @@
 import AppKit
 import MacCleanCore
-import QuickLook
 import QuickLookThumbnailing
 import SwiftUI
 
@@ -500,7 +499,6 @@ final class MediaModel: ObservableObject {
 struct MediaView: View {
     @StateObject private var model = MediaModel()
     @State private var confirmation: Confirmation?
-    @State private var previewURL: URL?
 
     private struct Confirmation: Identifiable {
         let id = UUID()
@@ -731,7 +729,7 @@ struct MediaView: View {
                     }
                     .width(24)
                     TableColumn("") { row in
-                        Button { previewURL = row.file.url } label: { Thumbnail(url: row.file.url) }
+                        Button { preview(row.file.url) } label: { Thumbnail(url: row.file.url) }
                             .buttonStyle(.plain)
                             .help("Xem trước")
                     }
@@ -761,7 +759,7 @@ struct MediaView: View {
                     .width(min: 110, ideal: 130)
                 }
                 .contextMenu(forSelectionType: String.self) { ids in
-                    Button("Xem trước") { previewURL = ids.first.map { URL(fileURLWithPath: $0) } }
+                    Button("Xem trước") { preview(ids.first.map { URL(fileURLWithPath: $0) }) }
                     Button("Hiện trong Finder") { reveal(ids) }
                     Button("Nén") {
                         model.selection = ids
@@ -772,15 +770,13 @@ struct MediaView: View {
                         confirmTrash()
                     }
                 } primaryAction: { ids in
-                    previewURL = ids.first.map { URL(fileURLWithPath: $0) }
+                    preview(ids.first.map { URL(fileURLWithPath: $0) })
                 }
                 .onKeyPress(.space) {
                     guard let id = model.selection.first else { return .ignored }
-                    previewURL = URL(fileURLWithPath: id)
+                    preview(URL(fileURLWithPath: id))
                     return .handled
                 }
-                // Quick Look cho phép dùng phím mũi tên để duyệt các file đang hiện.
-                .quickLookPreview($previewURL, in: model.visibleRows.map(\.file.url))
             }
         }
     }
@@ -807,6 +803,12 @@ struct MediaView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+
+    /// Quick Look cho phép dùng phím mũi tên để duyệt các file quanh file đang xem.
+    private func preview(_ url: URL?) {
+        guard let url else { return }
+        PreviewController.shared.show(url, among: model.visibleRows.map(\.file.url))
     }
 
     private func badge(_ text: String, _ color: Color) -> some View {
