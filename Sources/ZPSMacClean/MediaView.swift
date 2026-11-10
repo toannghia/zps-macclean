@@ -241,6 +241,19 @@ final class MediaModel: ObservableObject {
         marked.subtract(group.files.map(\.id))
     }
 
+    /// Chỉ các nhóm trên trang đang xem, để duyệt và chọn lần lượt từng trang.
+    func markExtrasOnPage() {
+        for group in pageGroups { markExtras(in: group) }
+    }
+
+    func unmarkPage() {
+        for group in pageGroups { unmark(group) }
+    }
+
+    var pageHasMarks: Bool {
+        pageGroups.contains { group in group.files.contains { marked.contains($0.id) } }
+    }
+
     func markExtrasEverywhere() {
         for group in duplicates { markExtras(in: group) }
     }
@@ -758,6 +771,14 @@ struct MediaView: View {
             Button { model.groupPage = model.groupPageCount - 1 } label: { Image(systemName: "chevron.right.2") }
                 .disabled(model.groupPage >= model.groupPageCount - 1)
             Spacer()
+            Button("Chọn bản thừa trên trang này") { model.markExtrasOnPage() }
+                .buttonStyle(.bordered)
+                .disabled(model.isBusy)
+            if model.pageHasMarks {
+                Button("Bỏ chọn trang này") { model.unmarkPage() }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isBusy)
+            }
             let first = model.groupPage * model.groupsPerPage + 1
             let last = min((model.groupPage + 1) * model.groupsPerPage, model.duplicates.count)
             Text("Nhóm \(first)–\(last) trong \(model.duplicates.count)").foregroundStyle(Brand.muted).monospacedDigit()
