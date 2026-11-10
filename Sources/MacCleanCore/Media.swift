@@ -3,6 +3,61 @@ import CryptoKit
 import Foundation
 import ImageIO
 
+/// Cờ dừng dùng chung giữa giao diện và các luồng đang quét.
+public final class StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false
+
+    public init() {}
+
+    public var isStopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
+
+    public func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
+    }
+
+    public func reset() {
+        lock.lock()
+        stopped = false
+        lock.unlock()
+    }
+}
+
+/// Chạy một việc trên mọi lõi CPU, giữ đúng thứ tự kết quả; mục chưa làm khi bị dừng là nil.
+public enum Parallel {
+    public static func map<T, R>(_ items: [T], stop: StopFlag? = nil, progress: ((Double) -> Void)? = nil,
+                                 _ transform: (T) -> R?) -> [R?] {
+        guard !items.isEmpty else { return [] }
+        var results = [R?](repeating: nil, count: items.count)
+        let chunk = 32
+        let chunks = (items.count + chunk - 1) / chunk
+        let lock = NSLock()
+        var finished = 0
+        results.withUnsafeMutableBufferPointer { buffer in
+            let output = buffer
+            DispatchQueue.concurrentPerform(iterations: chunks) { index in
+                guard stop?.isStopped != true else { return }
+                // Mỗi đợt ghi vào vùng chỉ số riêng nên không cần khoá khi ghi kết quả.
+                for item in index * chunk ..< min(items.count, (index + 1) * chunk) {
+                    output[item] = transform(items[item])
+                }
+                lock.lock()
+                finished += 1
+                let fraction = Double(finished) / Double(chunks)
+                lock.unlock()
+                progress?(fraction)
+            }
+        }
+        return results
+    }
+}
+
 public enum MediaKind: Sendable {
     case image, video
 }
@@ -37,8 +92,10 @@ public enum MediaScanner {
     }
 
     /// Liệt kê ảnh và video, bỏ qua file ẩn, gói như Photos Library, symlink và file iCloud chưa tải.
-    public static func files(in root: URL, recursive: Bool = true,
-                             progress: (Int) -> Void = { _ in }) -> [MediaFile] {
+    /// `batch` nhận từng đợt file mới tìm thấy để giao diện hiện dần; dừng giữa chừng thì trả phần đã có.
+    public static func files(in root: URL, recursive: Bool = true, stop: StopFlag? = nil,
+                             progress: (Int) -> Void = { _ in },
+                             batch: (([MediaFile]) -> Void)? = nil) -> [MediaFile] {
         let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
                                       .contentModificationDateKey, .isDirectoryKey]
         var options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
@@ -48,18 +105,30 @@ public enum MediaScanner {
             return []
         }
         var result: [MediaFile] = []
+        var pending: [MediaFile] = []
         for case let url as URL in walker {
+            if stop?.isStopped == true { break }
+            // Lọc theo đuôi trước khi hỏi hệ thống thuộc tính file, phần tốn thời gian nhất khi duyệt.
+            let isFolderCandidate = url.pathExtension.isEmpty || url.lastPathComponent == outputFolderName
+            guard let kind = kind(of: url) ?? (isFolderCandidate ? .image : nil) else { continue }
             guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
-            if values.isDirectory == true, url.lastPathComponent == outputFolderName {
-                walker.skipDescendants()
+            if values.isDirectory == true {
+                if url.lastPathComponent == outputFolderName { walker.skipDescendants() }
                 continue
             }
-            guard values.isRegularFile == true, values.isSymbolicLink != true,
-                  let kind = kind(of: url) else { continue }
-            result.append(MediaFile(url: url, size: Int64(values.fileSize ?? 0), kind: kind,
-                                    modified: values.contentModificationDate ?? .distantPast))
-            if result.count % 200 == 0 { progress(result.count) }
+            guard values.isRegularFile == true, values.isSymbolicLink != true, self.kind(of: url) != nil else { continue }
+            let file = MediaFile(url: url, size: Int64(values.fileSize ?? 0), kind: kind,
+                                 modified: values.contentModificationDate ?? .distantPast)
+            result.append(file)
+            pending.append(file)
+            if pending.count >= 1000 {
+                progress(result.count)
+                batch?(pending)
+                pending = []
+            }
         }
+        if !pending.isEmpty { batch?(pending) }
+        progress(result.count)
         return result
     }
 
@@ -128,48 +197,91 @@ public enum DuplicateFinder {
     /// Ngưỡng khác biệt tối đa giữa hai dấu vân tay 64 bit để coi là ảnh giống nhau.
     static let similarThreshold = 5
 
-    public static func find(_ files: [MediaFile], includeSimilar: Bool,
-                            progress: (Double, String) -> Void = { _, _ in }) -> [DuplicateGroup] {
-        var groups: [DuplicateGroup] = []
-        var grouped = Set<String>()
-        /// Ảnh đại diện của mỗi nhóm giống hệt, để bản đã thu nhỏ của nó vẫn được tìm ra.
+    public static func find(_ files: [MediaFile], includeSimilar: Bool, stop: StopFlag? = nil, index: MediaIndex? = nil,
+                            progress: @escaping @Sendable (Double, String) -> Void = { _, _ in }) -> [DuplicateGroup] {
+        let exactShare = includeSimilar ? 0.3 : 1
+        var groups = exactGroups(files, stop: stop, index: index) { progress(exactShare * $0, "Đang so sánh file cùng dung lượng") }
+        guard includeSimilar, stop?.isStopped != true else { return sorted(groups) }
+
+        // Mỗi nhóm giống hệt cử một ảnh đại diện, để bản đã thu nhỏ của nó vẫn được tìm ra.
         var representative: [String: Int] = [:]
-
-        let sameSize = Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size).values.filter { $0.count > 1 }
-        let candidates = sameSize.flatMap { $0 }
-        var hashes: [String: [MediaFile]] = [:]
-        for (index, file) in candidates.enumerated() {
-            progress(0.6 * Double(index) / Double(max(1, candidates.count)), file.url.lastPathComponent)
-            if let digest = sha256(file.url) { hashes[digest, default: []].append(file) }
+        var grouped = Set<String>()
+        for (index, group) in groups.enumerated() {
+            representative[group.suggestedKeep.id] = index
+            grouped.formUnion(group.files.map(\.id))
         }
-        for members in hashes.values where members.count > 1 {
-            let keeper = pickKeeper(members)
-            representative[keeper.id] = groups.count
-            groups.append(DuplicateGroup(files: members, match: .exact, suggestedKeep: keeper))
-            grouped.formUnion(members.map(\.id))
+        let images = files.filter { $0.kind == .image && (!grouped.contains($0.id) || representative[$0.id] != nil) }
+        let hashes = Parallel.map(images, stop: stop, progress: { progress(0.3 + 0.65 * $0, "Đang so sánh nội dung ảnh") }) {
+            index.differenceHash($0)
         }
-
-        if includeSimilar {
-            let images = files.filter { $0.kind == .image && (!grouped.contains($0.id) || representative[$0.id] != nil) }
-            var prints: [(file: MediaFile, hash: UInt64)] = []
-            for (index, file) in images.enumerated() {
-                progress(0.6 + 0.35 * Double(index) / Double(max(1, images.count)), file.url.lastPathComponent)
-                if let hash = differenceHash(file.url) { prints.append((file, hash)) }
+        // Dừng giữa chừng vẫn so các ảnh đã đọc xong.
+        let prints = zip(images, hashes).compactMap { file, hash in hash.map { (file: file, hash: $0) } }
+        progress(0.97, "Đang gom nhóm \(prints.count) ảnh")
+        var merged = Set<Int>()
+        for members in cluster(prints) {
+            var all = members.filter { representative[$0.id] == nil }
+            for index in members.compactMap({ representative[$0.id] }) {
+                all += groups[index].files
+                merged.insert(index)
             }
-            progress(0.96, "So sánh ảnh")
-            var merged = Set<Int>()
-            for members in cluster(prints) {
-                let exactIndexes = members.compactMap { representative[$0.id] }
-                var all = members.filter { representative[$0.id] == nil }
-                for index in exactIndexes {
-                    all += groups[index].files
-                    merged.insert(index)
-                }
-                groups.append(DuplicateGroup(files: all, match: .similar, suggestedKeep: pickKeeper(all)))
-            }
-            groups = groups.enumerated().filter { !merged.contains($0.offset) }.map(\.element)
+            groups.append(DuplicateGroup(files: all, match: .similar, suggestedKeep: pickKeeper(all)))
         }
-        return groups.sorted { $0.reclaimable > $1.reclaimable }
+        groups = groups.enumerated().filter { !merged.contains($0.offset) }.map(\.element)
+        return sorted(groups)
+    }
+
+    static func sorted(_ groups: [DuplicateGroup]) -> [DuplicateGroup] {
+        groups.sorted { $0.reclaimable > $1.reclaimable }
+    }
+
+    /// File giống hệt: cùng dung lượng, cùng dấu vân tay đầu và cuối, rồi xác nhận bằng băm toàn bộ.
+    static func exactGroups(_ files: [MediaFile], stop: StopFlag?, index: MediaIndex? = nil,
+                            progress: @escaping @Sendable (Double) -> Void) -> [DuplicateGroup] {
+        let candidates = Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size).values
+            .filter { $0.count > 1 }.flatMap { $0 }
+        let prints = Parallel.map(candidates, stop: stop, progress: { progress(0.7 * $0) }) { index.fingerprint($0) }
+        let byPrint = Dictionary(grouping: zip(candidates, prints).compactMap { file, print in print.map { (file, $0) } },
+                                 by: { "\($0.0.size):\($0.1)" })
+            .values.map { $0.map(\.0) }.filter { $0.count > 1 }
+
+        // File nhỏ đã được đọc trọn khi lấy dấu vân tay; file lớn mới cần băm lại toàn bộ cho chắc.
+        let needFull = byPrint.filter { $0[0].size > Int64(fingerprintChunk * 2) }.flatMap { $0 }
+        let full = Parallel.map(needFull, stop: stop, progress: { progress(0.7 + 0.3 * $0) }) { index.fullHash($0) }
+        let fullHash = Dictionary(uniqueKeysWithValues: zip(needFull.map(\.id), full).compactMap { id, hash in hash.map { (id, $0) } })
+
+        var groups: [DuplicateGroup] = []
+        for members in byPrint {
+            let confirmed: [[MediaFile]]
+            if members[0].size > Int64(fingerprintChunk * 2) {
+                confirmed = Dictionary(grouping: members.filter { fullHash[$0.id] != nil }, by: { fullHash[$0.id]! })
+                    .values.filter { $0.count > 1 }.map { $0 }
+            } else {
+                confirmed = [members]
+            }
+            for group in confirmed {
+                groups.append(DuplicateGroup(files: group, match: .exact, suggestedKeep: pickKeeper(group)))
+            }
+        }
+        return groups
+    }
+
+    static let fingerprintChunk = 64 * 1024
+
+    /// Băm 64 KB đầu và 64 KB cuối, đủ để loại gần như mọi cặp khác nhau mà không phải đọc hết file.
+    static func quickFingerprint(_ file: MediaFile) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        guard let head = try? handle.read(upToCount: fingerprintChunk) else { return nil }
+        hasher.update(data: head)
+        if file.size > Int64(fingerprintChunk * 2) {
+            guard (try? handle.seek(toOffset: UInt64(file.size) - UInt64(fingerprintChunk))) != nil,
+                  let tail = try? handle.read(upToCount: fingerprintChunk) else { return nil }
+            hasher.update(data: tail)
+        } else if let rest = try? handle.readToEnd() {
+            hasher.update(data: rest)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     static func pickKeeper(_ files: [MediaFile]) -> MediaFile {

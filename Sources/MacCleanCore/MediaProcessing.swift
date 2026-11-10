@@ -301,11 +301,15 @@ public enum OrganizeScheme: String, CaseIterable, Identifiable, Sendable {
 
 /// Sắp xếp ảnh vào thư mục theo ngày chụp, có lưu lại để hoàn tác.
 public enum PhotoOrganizer {
-    public static func plan(_ files: [MediaFile], root: URL, scheme: OrganizeScheme) -> [OrganizeMove] {
+    public static func plan(_ files: [MediaFile], root: URL, scheme: OrganizeScheme, stop: StopFlag? = nil,
+                            index: MediaIndex? = nil, progress: ((Double) -> Void)? = nil) -> [OrganizeMove] {
+        // Đọc ngày chụp song song; file chưa đọc kịp khi bị dừng thì không đưa vào kế hoạch.
+        let dates = Parallel.map(files, stop: stop, progress: progress) { index.captureDate($0) }
         var reserved = Set<String>()
         var moves: [OrganizeMove] = []
-        for file in files {
-            let folder = root.appendingPathComponent(scheme.folder(for: MediaScanner.captureDate(of: file)))
+        for (file, date) in zip(files, dates) {
+            guard let date else { continue }
+            let folder = root.appendingPathComponent(scheme.folder(for: date))
             if file.url.deletingLastPathComponent().standardizedFileURL == folder.standardizedFileURL { continue }
             let target = MediaFiles.uniqueURL(folder.appendingPathComponent(file.url.lastPathComponent),
                                               reserved: reserved)

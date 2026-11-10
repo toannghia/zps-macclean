@@ -19,6 +19,7 @@ final class MediaModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(folder?.path, forKey: "mediaFolder")
             reset()
+            loadLastScan()
         }
     }
     @Published var recursive = true
@@ -34,7 +35,14 @@ final class MediaModel: ObservableObject {
     @Published var imageOptions = ImageCompressionOptions()
     @Published var videoQuality = VideoQuality.hevc1080
     @Published var replaceVideos = false
-    @Published var rows: [MediaRow] = [] { didSet { refreshVisible() } }
+    @Published var rows: [MediaRow] = [] {
+        didSet {
+            if rows.count != rowIndex.count {
+                rowIndex = Dictionary(rows.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            refreshVisible()
+        }
+    }
     @Published var rowFilter = RowFilter.all { didSet { refreshVisible() } }
     @Published var largeMB = 3 { didSet { refreshVisible() } }
     @Published var sortOrder = [KeyPathComparator(\MediaRow.size, order: .reverse)] { didSet { refreshVisible() } }
@@ -51,7 +59,15 @@ final class MediaModel: ObservableObject {
     private let video = VideoCompressor()
     /// Thư mục và tuỳ chọn của lượt đang chạy, đọc được từ luồng nền.
     nonisolated(unsafe) private var scope: (folder: URL, recursive: Bool)?
-    private var cancelRequested = false
+    /// Đọc được từ luồng nền để các vòng lặp quét và nén dừng giữa chừng.
+    nonisolated let stopFlag = StopFlag()
+    nonisolated let index = MediaIndex.shared
+    /// Lần quét gần nhất của thư mục đang chọn, đọc từ chỉ mục.
+    @Published var lastScan: MediaIndex.FolderScan?
+    /// Số file của lượt quét đang chạy, ghi vào chỉ mục khi xong.
+    nonisolated(unsafe) private var scannedFiles = 0
+    @Published private(set) var stopped = false
+    private var rowIndex: [String: Int] = [:]
 
     init() {
         if let path = UserDefaults.standard.string(forKey: "mediaFolder"),
@@ -62,6 +78,15 @@ final class MediaModel: ObservableObject {
 
     var markedSize: Int64 {
         duplicates.flatMap(\.files).filter { marked.contains($0.id) }.reduce(0) { $0 + $1.size }
+    }
+
+    /// Chỉ đọc thông tin lần quét trước, không quét gì.
+    func loadLastScan() {
+        guard let folder else { return lastScan = nil }
+        Task.detached(priority: .utility) { [index] in
+            let last = index.lastScan(of: folder)
+            await MainActor.run { self.lastScan = last }
+        }
     }
 
     func reset() {
@@ -92,13 +117,26 @@ final class MediaModel: ObservableObject {
         guard !isBusy, let folder else { return }
         let recursive = recursive
         scope = (folder, recursive)
+        scannedFiles = 0
         isBusy = true
-        cancelRequested = false
+        stopFlag.reset()
+        stopped = false
         notice = nil
         progress = WorkProgress(phase: phase)
         Task.detached(priority: .userInitiated) { [self] in
+            self.index.loadIfNeeded()
             await work(self)
-            await MainActor.run { self.isBusy = false }
+            // Lưu cả khi bị dừng: phần đã đọc được dùng lại cho lần sau.
+            if !self.stopFlag.isStopped, self.scannedFiles > 0 {
+                self.index.recordScan(of: folder, files: self.scannedFiles)
+            }
+            self.index.save()
+            let last = self.index.lastScan(of: folder)
+            await MainActor.run {
+                self.isBusy = false
+                self.lastScan = last
+                self.refreshVisible()
+            }
         }
     }
 
@@ -109,10 +147,11 @@ final class MediaModel: ObservableObject {
     }
 
     /// Chạy ngoài luồng giao diện: thư mục lớn có thể mất vài chục giây để duyệt.
-    nonisolated private func listFiles(_ kind: MediaKind?, in folder: URL, recursive: Bool) -> [MediaFile] {
-        let all = MediaScanner.files(in: folder, recursive: recursive) { count in
-            self.report(0.02, "Đang tìm file", "\(count) file")
-        }
+    nonisolated private func listFiles(_ kind: MediaKind?, in folder: URL, recursive: Bool,
+                                       batch: (([MediaFile]) -> Void)? = nil) -> [MediaFile] {
+        let all = MediaScanner.files(in: folder, recursive: recursive, stop: stopFlag, progress: { count in
+            self.report(0.05, "Đang tìm file", "Đã tìm thấy \(count) file")
+        }, batch: batch.map { send in { found in send(kind.map { kind in found.filter { $0.kind == kind } } ?? found) } })
         return kind.map { kind in all.filter { $0.kind == kind } } ?? all
     }
 
@@ -122,13 +161,17 @@ final class MediaModel: ObservableObject {
         let similar = includeSimilar
         run("Đang tìm ảnh trùng") { model in
             let files = model.listFiles(nil, in: model.scope!.folder, recursive: model.scope!.recursive)
-            let groups = DuplicateFinder.find(files, includeSimilar: similar) { fraction, name in
-                model.report(fraction, "Đang so sánh \(files.count) file", name)
+            model.scannedFiles = files.count
+            let groups = DuplicateFinder.find(files, includeSimilar: similar, stop: model.stopFlag, index: model.index) { fraction, phase in
+                model.report(fraction, phase, "\(files.count) file")
             }
+            let stopped = model.stopFlag.isStopped
             await MainActor.run {
                 model.duplicates = groups
                 model.marked = Set(groups.flatMap { group in group.files.filter { $0 != group.suggestedKeep }.map(\.id) })
-                model.notice = groups.isEmpty ? "Không tìm thấy ảnh hoặc video trùng." : nil
+                model.stopped = stopped
+                model.notice = stopped ? "Đã dừng. Đang hiện \(groups.count) nhóm trùng tìm được trước khi dừng."
+                    : groups.isEmpty ? "Không tìm thấy ảnh hoặc video trùng." : nil
             }
         }
     }
@@ -166,7 +209,20 @@ final class MediaModel: ObservableObject {
 
     // MARK: Danh sách ảnh, video để nén hoặc xoá
 
+    private var lastRefresh = Date.distantPast
+    private var refreshPending = false
+
     func refreshVisible() {
+        if isBusy, Date().timeIntervalSince(lastRefresh) < 1 {
+            guard !refreshPending else { return }
+            refreshPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.refreshPending = false
+                self?.refreshVisible()
+            }
+            return
+        }
+        lastRefresh = Date()
         let limit = Int64(largeMB) * 1_000_000
         visibleRows = rows.filter { row in
             switch rowFilter {
@@ -188,34 +244,80 @@ final class MediaModel: ObservableObject {
 
     func listCandidates() {
         let kind: MediaKind = tool == .videos ? .video : .image
+        rows = []
+        selection = []
+        results = []
         run("Đang tìm file") { model in
-            let files = model.listFiles(kind, in: model.scope!.folder, recursive: model.scope!.recursive)
-            model.report(0.1, "Đang tìm file trùng", "\(files.count) file")
-            let groups = DuplicateFinder.find(files, includeSimilar: false) { fraction, name in
-                model.report(0.1 + 0.4 * fraction, "Đang tìm file trùng", name)
+            let stop = model.stopFlag
+            // Bảng hiện ngay từng đợt file tìm thấy, chưa có kích thước và nhãn trùng.
+            let files = model.listFiles(kind, in: model.scope!.folder, recursive: model.scope!.recursive) { found in
+                let fresh = found.map { MediaRow(file: $0, width: 0, height: 0, group: nil, copies: 1) }
+                Task { @MainActor in model.append(fresh) }
             }
-            var groupOf: [String: (id: String, count: Int)] = [:]
-            for group in groups {
-                for file in group.files { groupOf[file.id] = (group.id, group.files.count) }
-            }
-            var rows: [MediaRow] = []
-            rows.reserveCapacity(files.count)
-            for (index, file) in files.enumerated() {
-                if index % 100 == 0 {
-                    model.report(0.5 + 0.5 * Double(index) / Double(max(1, files.count)), "Đang đọc kích thước",
-                                 "\(index)/\(files.count)")
+            model.scannedFiles = files.count
+            if !stop.isStopped {
+                let groups = DuplicateFinder.find(files, includeSimilar: false, stop: stop, index: model.index) { fraction, phase in
+                    model.report(0.1 + 0.3 * fraction, phase, "\(files.count) file")
                 }
-                let size = kind == .image ? MediaScanner.dimensions(file.url) : nil
-                rows.append(MediaRow(file: file, width: size?.width ?? 0, height: size?.height ?? 0,
-                                     group: groupOf[file.id]?.id, copies: groupOf[file.id]?.count ?? 1))
+                await MainActor.run { model.apply(groups) }
             }
+            if kind == .image, !stop.isStopped {
+                // Đọc kích thước theo từng đợt để bảng cập nhật dần thay vì chờ hết.
+                let batches = stride(from: 0, to: files.count, by: 2000).map { Array(files[$0 ..< min(files.count, $0 + 2000)]) }
+                for (index, batch) in batches.enumerated() where !stop.isStopped {
+                    model.report(0.4 + 0.6 * Double(index) / Double(max(1, batches.count)), "Đang đọc kích thước ảnh",
+                                 "\(index * 2000)/\(files.count)")
+                    let sizes = Parallel.map(batch, stop: stop) { model.index.dimensions($0) }
+                    let update = Dictionary(uniqueKeysWithValues: zip(batch.map(\.id), sizes).compactMap { id, size in
+                        size.map { (id, $0) }
+                    })
+                    await MainActor.run { model.applyDimensions(update) }
+                }
+            }
+            let stopped = stop.isStopped
             await MainActor.run {
-                model.rows = rows
-                model.selection = []
-                model.results = []
-                model.notice = rows.isEmpty ? "Không có file phù hợp trong thư mục này." : nil
+                model.stopped = stopped
+                model.notice = stopped ? "Đã dừng. Đang hiện \(model.rows.count) file đã quét được; nhãn trùng và kích thước có thể chưa đủ."
+                    : model.rows.isEmpty ? "Không có file phù hợp trong thư mục này." : nil
             }
         }
+    }
+
+    /// Gom cả đợt rồi gán một lần: gán từng dòng sẽ khiến bảng lọc và sắp xếp lại hàng nghìn lần.
+    private func append(_ fresh: [MediaRow]) {
+        guard isBusy else { return }
+        var updated = rows
+        var index = rowIndex
+        for row in fresh where index[row.id] == nil {
+            index[row.id] = updated.count
+            updated.append(row)
+        }
+        rowIndex = index
+        rows = updated
+    }
+
+    private func apply(_ groups: [DuplicateGroup]) {
+        var updated = rows
+        for group in groups {
+            for file in group.files {
+                if let index = rowIndex[file.id] {
+                    updated[index].group = group.id
+                    updated[index].copies = group.files.count
+                }
+            }
+        }
+        rows = updated
+    }
+
+    private func applyDimensions(_ sizes: [String: (width: Int, height: Int)]) {
+        var updated = rows
+        for (id, size) in sizes {
+            if let index = rowIndex[id] {
+                updated[index].width = size.width
+                updated[index].height = size.height
+            }
+        }
+        rows = updated
     }
 
     func selectAllVisible() {
@@ -250,6 +352,7 @@ final class MediaModel: ObservableObject {
             }
             let size = chosen.filter { moved.contains($0.id) }.reduce(Int64(0)) { $0 + $1.size }
             await MainActor.run {
+                model.rowIndex = [:]
                 model.rows = MediaRow.recount(model.rows.filter { !moved.contains($0.id) })
                 model.selection = []
                 model.notice = "Đã chuyển \(moved.count) file (\(formatBytes(size))) vào Thùng rác."
@@ -265,7 +368,7 @@ final class MediaModel: ObservableObject {
         run("Đang nén ảnh") { model in
             var results: [CompressionResult] = []
             for (index, file) in files.enumerated() {
-                if await model.cancelRequested { break }
+                if model.stopFlag.isStopped { break }
                 model.report(Double(index) / Double(max(1, files.count)), "Đang nén ảnh (\(index + 1)/\(files.count))",
                              file.url.lastPathComponent)
                 results.append(ImageCompressor.compress(file, options: options, root: folder))
@@ -283,7 +386,7 @@ final class MediaModel: ObservableObject {
         run("Đang nén video") { model in
             var results: [CompressionResult] = []
             for (index, file) in files.enumerated() {
-                if await model.cancelRequested { break }
+                if model.stopFlag.isStopped { break }
                 let label = "Đang nén video (\(index + 1)/\(files.count))"
                 let result = await compressor.compress(file, quality: quality, replaceOriginal: replace, root: folder) { part in
                     model.report((Double(index) + part) / Double(files.count), label, file.url.lastPathComponent)
@@ -295,7 +398,7 @@ final class MediaModel: ObservableObject {
     }
 
     func cancel() {
-        cancelRequested = true
+        stopFlag.stop()
         video.cancel()
     }
 
@@ -304,7 +407,7 @@ final class MediaModel: ObservableObject {
         let saved = results.reduce(Int64(0)) { $0 + $1.saved }
         let done = results.filter { $0.output != nil }.count
         notice = "Đã nén \(done)/\(results.count) file, tiết kiệm \(formatBytes(saved))."
-            + (cancelRequested ? " Đã dừng theo yêu cầu." : "")
+            + (stopFlag.isStopped ? " Đã dừng theo yêu cầu." : "")
     }
 
     // MARK: Sắp xếp
@@ -314,11 +417,16 @@ final class MediaModel: ObservableObject {
         let scheme = scheme
         run("Đang đọc ngày chụp") { model in
             let files = model.listFiles(nil, in: model.scope!.folder, recursive: model.scope!.recursive)
-            model.report(0.5, "Đang đọc ngày chụp", "\(files.count) file")
-            let plan = PhotoOrganizer.plan(files, root: folder, scheme: scheme)
+            model.scannedFiles = files.count
+            let plan = PhotoOrganizer.plan(files, root: folder, scheme: scheme, stop: model.stopFlag, index: model.index) { fraction in
+                model.report(0.1 + 0.9 * fraction, "Đang đọc ngày chụp", "\(files.count) file")
+            }
+            let stopped = model.stopFlag.isStopped
             await MainActor.run {
                 model.plan = plan
-                model.notice = plan.isEmpty ? "Ảnh đã được xếp đúng chỗ." : nil
+                model.stopped = stopped
+                model.notice = stopped ? "Đã dừng. Kế hoạch chỉ gồm \(plan.count) file đã đọc được ngày chụp."
+                    : plan.isEmpty ? "Ảnh đã được xếp đúng chỗ." : nil
             }
         }
     }
@@ -393,6 +501,7 @@ struct MediaView: View {
             Button("Huỷ", role: .cancel) {}
         } message: { Text($0.message) }
         .onChange(of: model.tool) { model.reset() }
+        .onAppear { model.loadLastScan() }
     }
 
     private var header: some View {
@@ -484,20 +593,36 @@ struct MediaView: View {
                 Button("Chọn thư mục…") { model.chooseFolder() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if model.isBusy {
-            WorkProgressView(progress: model.progress, cancel: cancelAction)
+        } else if model.isBusy, !hasPartialResults {
+            WorkProgressView(progress: model.progress, cancel: { model.cancel() })
         } else {
-            switch model.tool {
-            case .duplicates: duplicateList
-            case .images, .videos: compressionList
-            case .organize: organizeList
+            VStack(spacing: 0) {
+                if model.isBusy { progressBanner }
+                switch model.tool {
+                case .duplicates: duplicateList
+                case .images, .videos: compressionList
+                case .organize: organizeList
+                }
             }
         }
     }
 
-    private var cancelAction: (() -> Void)? {
-        guard model.tool == .images || model.tool == .videos else { return nil }
-        return { model.cancel() }
+    /// Bảng ảnh, video được hiện ngay trong lúc quét; các công cụ khác chờ tới khi xong.
+    private var hasPartialResults: Bool {
+        (model.tool == .images || model.tool == .videos) && !model.rows.isEmpty && model.results.isEmpty
+    }
+
+    private var progressBanner: some View {
+        HStack(spacing: 12) {
+            ProgressView(value: model.progress.fraction).tint(Brand.teal).frame(width: 160)
+            Text(model.progress.phase).fontWeight(.medium).foregroundStyle(Brand.navy)
+            Text(model.progress.detail).foregroundStyle(Brand.muted).lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Button("Dừng") { model.cancel() }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Brand.teal.opacity(0.08))
     }
 
     @ViewBuilder private var duplicateList: some View {
@@ -774,7 +899,15 @@ struct MediaView: View {
         ContentUnavailableView {
             Label(title, systemImage: "photo.stack")
         } description: {
-            Text(text)
+            VStack(spacing: 6) {
+                Text(text)
+                if let last = model.lastScan {
+                    Text("Đã quét thư mục này lúc \(last.date.formatted(date: .abbreviated, time: .shortened)). Lần quét tới chỉ đọc lại file mới hoặc đã thay đổi nên sẽ nhanh hơn.")
+                        .foregroundStyle(Brand.teal)
+                } else {
+                    Text("Chưa quét thư mục này. Lần đầu với thư mục lớn có thể mất vài phút; có thể bấm Dừng bất cứ lúc nào.")
+                }
+            }
         } actions: {
             Button(startTitle, action: start)
                 .buttonStyle(.borderedProminent)
@@ -816,10 +949,10 @@ enum RowFilter: String, CaseIterable, Identifiable {
 /// Một dòng trong bảng ảnh hoặc video.
 struct MediaRow: Identifiable, Sendable {
     let file: MediaFile
-    let width: Int
-    let height: Int
+    var width: Int
+    var height: Int
     /// Nhóm file giống hệt nhau, nil nếu không trùng với file nào.
-    let group: String?
+    var group: String?
     var copies: Int
 
     var id: String { file.id }
@@ -873,7 +1006,7 @@ private struct WorkProgressView: View {
             Text(progress.detail).font(.callout).foregroundStyle(Brand.muted).lineLimit(1).truncationMode(.middle)
                 .frame(width: 420, height: 18)
             Text("\(Int(progress.fraction * 100))%").font(Brand.heading(13, "SemiBold")).foregroundStyle(Brand.navy)
-            if let cancel { Button("Dừng sau file hiện tại", action: cancel) }
+            if let cancel { Button("Dừng và xem kết quả đã quét", action: cancel) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

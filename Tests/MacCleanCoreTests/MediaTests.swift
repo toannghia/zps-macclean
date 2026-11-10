@@ -228,4 +228,39 @@ final class MediaTests: XCTestCase {
         XCTAssertFalse(DuplicateFinder.looksLikeCopy("IMG_2024.jpg"))
         XCTAssertFalse(DuplicateFinder.looksLikeCopy("Copywriting.png"))
     }
+
+    func testIndexReusesFactsAndRereadsChangedFiles() throws {
+        let photo = try writeImage("a.jpg", width: 300, height: 200)
+        try FileManager.default.copyItem(at: photo, to: root.appendingPathComponent("b.jpg"))
+        let indexFile = root.appendingPathComponent("index/media-index.json")
+        let index = MediaIndex(location: indexFile)
+        XCTAssertEqual(DuplicateFinder.find(files(), includeSimilar: true, index: index).count, 1)
+        for file in files() { _ = index.dimensions(file) }
+        index.recordScan(of: root, files: 2)
+        index.save()
+
+        // Chỉ mục đọc lại từ đĩa trả đúng giá trị cũ mà không cần đọc ảnh.
+        let reloaded = MediaIndex(location: indexFile)
+        reloaded.loadIfNeeded()
+        XCTAssertEqual(reloaded.lastScan(of: root)?.files, 2)
+        let file = try XCTUnwrap(files().first { $0.url.lastPathComponent == "a.jpg" })
+        XCTAssertEqual(reloaded.value(file, \.width) { XCTFail("phải lấy từ chỉ mục"); return nil }, 300)
+        XCTAssertNotNil(reloaded.value(file, \.fingerprint) { XCTFail("dấu vân tay phải lấy từ chỉ mục"); return nil })
+
+        // File đổi nội dung thì phải đọc lại, không dùng số cũ.
+        try writeImage("a.jpg", width: 120, height: 80, seed: 1)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: photo.path)
+        let changed = try XCTUnwrap(files().first { $0.url.lastPathComponent == "a.jpg" })
+        XCTAssertEqual(reloaded.dimensions(changed)?.width, 120)
+        XCTAssertTrue(DuplicateFinder.find(files(), includeSimilar: false, index: reloaded).isEmpty)
+    }
+
+    func testStopKeepsPartialWork() {
+        let stop = StopFlag()
+        stop.stop()
+        let results = Parallel.map(Array(0..<1000), stop: stop) { $0 * 2 }
+        XCTAssertTrue(results.allSatisfy { $0 == nil })
+        let all = Parallel.map(Array(0..<1000)) { $0 * 2 }
+        XCTAssertEqual(all.compactMap { $0 }, (0..<1000).map { $0 * 2 })
+    }
 }

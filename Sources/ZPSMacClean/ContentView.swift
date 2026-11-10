@@ -39,7 +39,8 @@ struct ContentView: View {
         .tint(Brand.teal)
         .preferredColorScheme(.light)
         .frame(minWidth: 1100, minHeight: 720)
-        .onAppear { model.scan() }
+        // Không tự quét khi mở app: lần quét đầu có thể nặng nên chỉ chạy khi người dùng bấm.
+        .onAppear { model.refreshDisk() }
         // Docker và APFS trả dung lượng chậm hơn lúc xoá nên phải đo lại liên tục.
         .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in model.refreshDisk() }
         .sheet(isPresented: $showSettings) { SettingsSheet().environmentObject(model) }
@@ -176,6 +177,18 @@ struct ContentView: View {
         let items = model.items(in: category)
         if model.isBusy, items.isEmpty {
             ScanProgressView(progress: model.progress)
+        } else if model.lastScan == nil, model.scanError == nil {
+            ContentUnavailableView {
+                Label("Sẵn sàng quét", systemImage: "magnifyingglass")
+            } description: {
+                Text("Bấm Quét để tìm rác của công cụ lập trình, AI, trình duyệt và dự án. App chỉ đọc khi quét, chưa xoá gì cho tới khi bạn bấm Dọn dẹp.")
+            } actions: {
+                Button("Quét") { model.scan() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Brand.teal)
+                    .controlSize(.large)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if items.isEmpty {
             ContentUnavailableView {
                 Label(model.scanError == nil ? "Không có gì để dọn" : "Chưa quét được",

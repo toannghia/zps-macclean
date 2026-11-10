@@ -10,6 +10,8 @@ final class AppModel: ObservableObject {
     @Published var progress = WorkProgress()
     @Published var report: CleanReport?
     @Published var scanError: String?
+    /// Thời điểm quét xong gần nhất; nil là chưa quét lần nào từ khi mở app.
+    @Published var lastScan: Date?
     @Published var disks: [DiskInfo] = []
     @Published var retentionDays: Int {
         didSet { UserDefaults.standard.set(retentionDays, forKey: "retentionDays") }
@@ -66,6 +68,7 @@ final class AppModel: ObservableObject {
                 self.scanError = result == nil ? "Không kiểm tra được file đang mở nên chưa quét. Hãy thử quét lại." : nil
                 let found = result ?? []
                 self.items = found
+                self.lastScan = Date()
                 self.selected = Set(found.filter { $0.risk == .safe && !$0.isBlocked }.map(\.id))
                 self.isBusy = false
             }
