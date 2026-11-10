@@ -292,4 +292,25 @@ final class MediaTests: XCTestCase {
         let after = ProcessMonitor.memoryFootprint(getpid()) ?? 0
         XCTAssertLessThan(after - before, 50 * 1024 * 1024)
     }
+
+    func testGroupAfterRemovingFilesKeepsValidKeeper() throws {
+        let original = try writeImage("a/IMG_1.jpg", width: 300, height: 200)
+        for name in ["b/IMG_1 copy.jpg", "c/IMG_1 (1).jpg"] {
+            let target = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: original, to: target)
+        }
+        let group = try XCTUnwrap(DuplicateFinder.find(files(), includeSimilar: false).first)
+        XCTAssertEqual(group.suggestedKeep.url.lastPathComponent, "IMG_1.jpg")
+
+        // Bỏ bản tốt nhất: còn hai bản thì vẫn là nhóm, bản giữ được chọn lại trong số còn lại.
+        let withoutKeeper = try XCTUnwrap(group.removing([group.suggestedKeep.id]))
+        XCTAssertEqual(withoutKeeper.files.count, 2)
+        XCTAssertTrue(withoutKeeper.files.contains(withoutKeeper.suggestedKeep))
+
+        // Chỉ còn một file thì không còn là nhóm trùng.
+        let copies = Set(group.files.filter { $0 != group.suggestedKeep }.map(\.id))
+        XCTAssertNil(group.removing(copies))
+        XCTAssertEqual(group.removing([]).map(\.files.count), 3)
+    }
 }

@@ -202,6 +202,15 @@ public struct DuplicateGroup: Identifiable, Sendable {
     public var id: String { suggestedKeep.id }
 
     public var reclaimable: Int64 { files.filter { $0 != suggestedKeep }.reduce(0) { $0 + $1.size } }
+
+    /// Nhóm còn lại sau khi một số file đã được chuyển đi; nil khi không còn đủ hai file để coi là trùng.
+    public func removing(_ ids: Set<String>) -> DuplicateGroup? {
+        let remaining = files.filter { !ids.contains($0.id) }
+        guard remaining.count > 1 else { return nil }
+        guard remaining.count != files.count else { return self }
+        let keeper = remaining.contains(suggestedKeep) ? suggestedKeep : DuplicateFinder.pickKeeper(remaining)
+        return DuplicateGroup(files: remaining, match: match, suggestedKeep: keeper)
+    }
 }
 
 public enum DuplicateFinder {

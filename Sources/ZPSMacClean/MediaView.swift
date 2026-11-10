@@ -30,6 +30,8 @@ final class MediaModel: ObservableObject {
     @Published var duplicates: [DuplicateGroup] = [] { didSet { groupPage = min(groupPage, groupPageCount - 1) } }
     /// Trang nhóm trùng đang xem, mỗi trang vài chục nhóm để danh sách hàng nghìn nhóm vẫn cuộn mượt.
     @Published var groupPage = 0
+    /// Lượt tìm trùng gần nhất bị dừng giữa chừng, còn phần chưa quét.
+    @Published var duplicatesPartial = false
     let groupsPerPage = 50
 
     var groupPageCount: Int { max(1, (duplicates.count + groupsPerPage - 1) / groupsPerPage) }
@@ -221,12 +223,14 @@ final class MediaModel: ObservableObject {
             }
             let stopped = model.stopFlag.isStopped
             await MainActor.run {
-                model.groupPage = 0
+                // Quét tiếp giữ nguyên trang và các file đã tick nếu chúng vẫn còn trong kết quả.
+                let page = model.groupPage
                 model.duplicates = groups
-                // Không chọn sẵn gì: chỉ file người dùng tự bấm chọn mới bị chuyển vào Thùng rác.
-                model.marked = []
+                model.marked.formIntersection(Set(groups.flatMap { $0.files.map(\.id) }))
+                model.groupPage = min(page, model.groupPageCount - 1)
+                model.duplicatesPartial = stopped
                 model.stopped = stopped
-                model.notice = stopped ? "Đã dừng. Đang hiện \(groups.count) nhóm trùng tìm được trước khi dừng."
+                model.notice = stopped ? "Đã dừng. Đang hiện \(groups.count) nhóm trùng tìm được trước khi dừng; bấm Quét tiếp để làm nốt phần còn lại."
                     : groups.isEmpty ? "Không tìm thấy ảnh hoặc video trùng." : nil
             }
         }
@@ -272,19 +276,26 @@ final class MediaModel: ObservableObject {
         let files = duplicates.flatMap(\.files).filter { marked.contains($0.id) }
         run("Đang chuyển vào Thùng rác") { model in
             var failures: [String] = []
+            var moved = Set<String>()
             for (index, file) in files.enumerated() {
                 model.report(Double(index) / Double(max(1, files.count)), "Đang chuyển vào Thùng rác", file.url.lastPathComponent)
-                do { try MediaFiles.trash(file.url) } catch {
+                do {
+                    try MediaFiles.trash(file.url)
+                    moved.insert(file.id)
+                } catch {
                     failures.append("\(file.url.lastPathComponent): \(error.localizedDescription)")
                 }
             }
-            let size = files.reduce(Int64(0)) { $0 + $1.size }
+            let size = files.filter { moved.contains($0.id) }.reduce(Int64(0)) { $0 + $1.size }
             await MainActor.run {
+                // Giữ nguyên danh sách và trang đang xem; chỉ gỡ các file vừa chuyển đi.
+                let page = model.groupPage
+                model.duplicates = model.duplicates.compactMap { $0.removing(moved) }
+                model.marked.subtract(moved)
+                model.groupPage = min(page, model.groupPageCount - 1)
                 model.notice = failures.isEmpty
-                    ? "Đã chuyển \(files.count) file (\(formatBytes(size))) vào Thùng rác. Đổ Thùng rác để giải phóng dung lượng."
-                    : "Còn \(failures.count) file chưa chuyển được: \(failures.first ?? "")"
-                model.duplicates = []
-                model.marked = []
+                    ? "Đã chuyển \(moved.count) file (\(formatBytes(size))) vào Thùng rác. Đổ Thùng rác để giải phóng dung lượng."
+                    : "Đã chuyển \(moved.count) file. Còn \(failures.count) file chưa chuyển được: \(failures.first ?? "")"
             }
         }
     }
@@ -1035,7 +1046,12 @@ struct MediaView: View {
         let disabled = model.isBusy || model.folder == nil
         switch model.tool {
         case .duplicates:
-            Button("Tìm trùng") { model.findDuplicates() }.disabled(disabled)
+            if model.duplicatesPartial {
+                primary("Quét tiếp phần còn lại") { model.findDuplicates() }.disabled(disabled)
+                    .help("Phần đã quét được lấy lại từ chỉ mục nên rất nhanh; chỉ file chưa quét mới phải đọc.")
+            } else {
+                Button(model.duplicates.isEmpty ? "Tìm trùng" : "Quét lại") { model.findDuplicates() }.disabled(disabled)
+            }
             if !model.duplicates.isEmpty {
                 if model.marked.isEmpty {
                     Button("Chọn bản thừa ở mọi nhóm") { model.markExtrasEverywhere() }.disabled(disabled)
