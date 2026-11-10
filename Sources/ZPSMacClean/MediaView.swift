@@ -42,6 +42,8 @@ final class MediaModel: ObservableObject {
     @Published var lastOrganize: (moves: [OrganizeMove], copied: Bool)?
 
     private let video = VideoCompressor()
+    /// Thư mục và tuỳ chọn của lượt đang chạy, đọc được từ luồng nền.
+    nonisolated(unsafe) private var scope: (folder: URL, recursive: Bool)?
     private var cancelRequested = false
 
     init() {
@@ -79,7 +81,9 @@ final class MediaModel: ObservableObject {
     }
 
     private func run(_ phase: String, _ work: @escaping @Sendable (MediaModel) async -> Void) {
-        guard !isBusy, folder != nil else { return }
+        guard !isBusy, let folder else { return }
+        let recursive = recursive
+        scope = (folder, recursive)
         isBusy = true
         cancelRequested = false
         notice = nil
@@ -96,10 +100,10 @@ final class MediaModel: ObservableObject {
         }
     }
 
-    private func listFiles(_ kind: MediaKind?) -> [MediaFile] {
-        guard let folder else { return [] }
+    /// Chạy ngoài luồng giao diện: thư mục lớn có thể mất vài chục giây để duyệt.
+    nonisolated private func listFiles(_ kind: MediaKind?, in folder: URL, recursive: Bool) -> [MediaFile] {
         let all = MediaScanner.files(in: folder, recursive: recursive) { count in
-            Task { @MainActor in self.progress = WorkProgress(fraction: 0.02, phase: "Đang tìm file", detail: "\(count) file") }
+            self.report(0.02, "Đang tìm file", "\(count) file")
         }
         return kind.map { kind in all.filter { $0.kind == kind } } ?? all
     }
@@ -109,7 +113,7 @@ final class MediaModel: ObservableObject {
     func findDuplicates() {
         let similar = includeSimilar
         run("Đang tìm ảnh trùng") { model in
-            let files = await model.listFiles(nil)
+            let files = model.listFiles(nil, in: model.scope!.folder, recursive: model.scope!.recursive)
             let groups = DuplicateFinder.find(files, includeSimilar: similar) { fraction, name in
                 model.report(fraction, "Đang so sánh \(files.count) file", name)
             }
@@ -157,7 +161,7 @@ final class MediaModel: ObservableObject {
     func listCandidates() {
         let kind: MediaKind = tool == .videos ? .video : .image
         run("Đang tìm file") { model in
-            let files = await model.listFiles(kind).sorted { $0.size > $1.size }
+            let files = model.listFiles(kind, in: model.scope!.folder, recursive: model.scope!.recursive).sorted { $0.size > $1.size }
             await MainActor.run {
                 model.candidates = files
                 model.results = []
@@ -221,7 +225,7 @@ final class MediaModel: ObservableObject {
         guard let folder else { return }
         let scheme = scheme
         run("Đang đọc ngày chụp") { model in
-            let files = await model.listFiles(nil)
+            let files = model.listFiles(nil, in: model.scope!.folder, recursive: model.scope!.recursive)
             model.report(0.5, "Đang đọc ngày chụp", "\(files.count) file")
             let plan = PhotoOrganizer.plan(files, root: folder, scheme: scheme)
             await MainActor.run {
@@ -563,8 +567,33 @@ struct MediaView: View {
     }
 
     private func placeholder(_ title: String, _ text: String) -> some View {
-        ContentUnavailableView(title, systemImage: "photo.stack", description: Text(text))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        ContentUnavailableView {
+            Label(title, systemImage: "photo.stack")
+        } description: {
+            Text(text)
+        } actions: {
+            Button(startTitle, action: start)
+                .buttonStyle(.borderedProminent)
+                .tint(Brand.teal)
+                .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var startTitle: String {
+        switch model.tool {
+        case .duplicates: return "Tìm trùng"
+        case .images, .videos: return "Liệt kê file"
+        case .organize: return "Xem trước"
+        }
+    }
+
+    private func start() {
+        switch model.tool {
+        case .duplicates: model.findDuplicates()
+        case .images, .videos: model.listCandidates()
+        case .organize: model.makePlan()
+        }
     }
 
     private func relative(_ url: URL) -> String {

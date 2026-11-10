@@ -40,6 +40,7 @@ struct ZPSMacCleanApp: App {
             ContentView().environmentObject(model)
         }
         .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1280, height: 860)
         .windowResizability(.contentMinSize)
     }
 }

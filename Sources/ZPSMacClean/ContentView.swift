@@ -8,19 +8,22 @@ struct ContentView: View {
     @State private var showConfirm = false
     @State private var showSettings = false
     @State private var showHelp = false
-    @State private var showProcesses = false
-    @State private var showMedia = false
+    @State private var screen = Screen.clean
+
+    private enum Screen {
+        case clean, processes, media
+    }
     @State private var columns = NavigationSplitViewVisibility.all
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 250, ideal: 270)
+                .navigationSplitViewColumnWidth(min: 280, ideal: 300, max: 360)
         } detail: {
             VStack(spacing: 0) {
-                if showMedia {
+                if screen == .media {
                     MediaView()
-                } else if showProcesses {
+                } else if screen == .processes {
                     ProcessesView()
                 } else {
                     header
@@ -35,7 +38,7 @@ struct ContentView: View {
         }
         .tint(Brand.teal)
         .preferredColorScheme(.light)
-        .frame(minWidth: 940, minHeight: 600)
+        .frame(minWidth: 1100, minHeight: 720)
         .onAppear { model.scan() }
         // Docker và APFS trả dung lượng chậm hơn lúc xoá nên phải đo lại liên tục.
         .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in model.refreshDisk() }
@@ -54,8 +57,7 @@ struct ContentView: View {
 
     private func open(_ item: CleanCategory?) {
         category = item
-        showProcesses = false
-        showMedia = false
+        screen = .clean
     }
 
     private var confirmTitle: String {
@@ -71,33 +73,9 @@ struct ContentView: View {
         return lines.joined(separator: "\n")
     }
 
+    /// Logo và tagline nằm ngoài danh sách cuộn để không bị chồng lên các mục.
     private var sidebar: some View {
-        List {
-            Section {
-                ForEach(model.disks) { DiskGauge(disk: $0) }
-            }
-            Section {
-                SidebarRow(title: "Tiến trình", symbol: "cpu", color: Brand.green, size: 0,
-                           isSelected: showProcesses) {
-                    showProcesses = true
-                    showMedia = false
-                }
-                SidebarRow(title: "Ảnh & Video", symbol: "photo.on.rectangle", color: Brand.teal, size: 0,
-                           isSelected: showMedia) {
-                    showMedia = true
-                    showProcesses = false
-        showMedia = false
-                }
-                SidebarRow(title: "Tất cả", symbol: "square.grid.2x2", color: Brand.navy,
-                           size: model.totalFound, isSelected: !showProcesses && !showMedia && category == nil) { open(nil) }
-                ForEach(CleanCategory.allCases) { item in
-                    SidebarRow(title: item.title, symbol: item.symbol, color: item.color,
-                               size: model.size(of: item), isSelected: !showProcesses && !showMedia && category == item) { open(item) }
-                }
-            }
-        }
-        .scrollContentBackground(.hidden)
-        .safeAreaInset(edge: .top, spacing: 0) {
+        VStack(spacing: 0) {
             Group {
                 if let logo = Brand.logo {
                     Image(nsImage: logo).resizable().interpolation(.high).scaledToFit()
@@ -105,12 +83,32 @@ struct ContentView: View {
                     Text("ZERO POINT SYSTEMS").font(Brand.heading(13)).foregroundStyle(Brand.navy)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: 54, alignment: .leading)
             .padding(.horizontal, 18)
-            .padding(.top, 12)
+            .padding(.top, 8)
             .padding(.bottom, 10)
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 10) {
+                ForEach(model.disks) { DiskGauge(disk: $0) }
+            }
+            .padding(.horizontal, 18)
+            .padding(.bottom, 10)
+            Divider().padding(.horizontal, 12)
+            List {
+                SidebarRow(title: "Tiến trình", symbol: "cpu", color: Brand.green, size: 0,
+                           isSelected: screen == .processes) { screen = .processes }
+                SidebarRow(title: "Ảnh & Video", symbol: "photo.on.rectangle", color: Brand.teal, size: 0,
+                           isSelected: screen == .media) { screen = .media }
+                Text("Dọn rác").font(.caption.weight(.semibold)).foregroundStyle(Brand.muted)
+                    .padding(.top, 8).padding(.leading, 8)
+                SidebarRow(title: "Tất cả", symbol: "square.grid.2x2", color: Brand.navy,
+                           size: model.totalFound, isSelected: screen == .clean && category == nil) { open(nil) }
+                ForEach(CleanCategory.allCases) { item in
+                    SidebarRow(title: item.title, symbol: item.symbol, color: item.color,
+                               size: model.size(of: item), isSelected: screen == .clean && category == item) { open(item) }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            Divider().padding(.horizontal, 12)
             VStack(alignment: .leading, spacing: 1) {
                 Text("From Zero To Possibilities.")
                 Text("Build Smart. Scale Fast.")
@@ -119,7 +117,7 @@ struct ContentView: View {
             .foregroundStyle(Brand.teal)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 18)
-            .padding(.vertical, 12)
+            .padding(.vertical, 10)
         }
         .background(Brand.surface)
     }
@@ -257,18 +255,18 @@ private struct DiskGauge: View {
     let disk: DiskInfo
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(disk.name).font(.caption).foregroundStyle(Brand.muted)
-            Text("\(formatBytes(disk.free)) trống")
-                .font(Brand.heading(17)).foregroundStyle(Brand.navy)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(disk.name).font(.caption).foregroundStyle(Brand.muted)
+                Spacer()
+                Text("\(formatBytes(disk.free)) trống").font(Brand.heading(14)).foregroundStyle(Brand.navy)
+            }
             if disk.total > 0 {
                 ProgressView(value: Double(disk.total - disk.free), total: Double(disk.total))
                     .tint(Double(disk.free) / Double(disk.total) < 0.1 ? Brand.warning : Brand.green)
-                Text("trên tổng \(formatBytes(disk.total))")
-                    .font(.caption).foregroundStyle(Brand.muted)
+                Text("trên tổng \(formatBytes(disk.total))").font(.caption2).foregroundStyle(Brand.muted)
             }
         }
-        .padding(.vertical, 4)
     }
 }
 
