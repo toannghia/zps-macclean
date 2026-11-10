@@ -313,4 +313,32 @@ final class MediaTests: XCTestCase {
         XCTAssertNil(group.removing(copies))
         XCTAssertEqual(group.removing([]).map(\.files.count), 3)
     }
+
+    func testBandedClusteringMatchesPairwiseComparison() {
+        var generator = SystemRandomNumberGenerator()
+        var hashes: [UInt64] = (0 ..< 400).map { _ in UInt64.random(in: .min ... .max, using: &generator) }
+        // Thêm các biến thể lệch 1 tới 5 bit, phải được gom chung với ảnh gốc.
+        for base in hashes.prefix(60) {
+            var variant = base
+            for _ in 0 ..< Int.random(in: 1...5, using: &generator) { variant ^= 1 << UInt64.random(in: 0...63, using: &generator) }
+            hashes.append(variant)
+        }
+        let prints = hashes.enumerated().map { index, hash in
+            (file: MediaFile(url: URL(fileURLWithPath: "/tmp/\(index).jpg"), size: 1, kind: .image, modified: .distantPast), hash: hash)
+        }
+        func pairwise() -> Set<Set<String>> {
+            var parent = Array(prints.indices)
+            func root(_ i: Int) -> Int { parent[i] == i ? i : root(parent[i]) }
+            for i in prints.indices {
+                for j in (i + 1) ..< prints.count where (prints[i].hash ^ prints[j].hash).nonzeroBitCount <= DuplicateFinder.similarThreshold {
+                    parent[root(j)] = root(i)
+                }
+            }
+            return Set(Dictionary(grouping: prints.indices, by: root).values.filter { $0.count > 1 }
+                .map { Set($0.map { prints[$0].file.id }) })
+        }
+        let banded = Set(DuplicateFinder.cluster(prints).map { Set($0.map(\.id)) })
+        XCTAssertEqual(banded, pairwise())
+        XCTAssertGreaterThanOrEqual(banded.count, 50)
+    }
 }

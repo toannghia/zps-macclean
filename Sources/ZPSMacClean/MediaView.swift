@@ -98,6 +98,8 @@ final class MediaModel: ObservableObject {
     /// Số file của lượt quét đang chạy, ghi vào chỉ mục khi xong.
     nonisolated(unsafe) private var scannedFiles = 0
     @Published private(set) var stopped = false
+    /// Đã bấm Dừng, đang chờ các luồng đọc file kết thúc.
+    @Published private(set) var stopping = false
     private var rowIndex: [String: Int] = [:]
 
     init() {
@@ -151,6 +153,7 @@ final class MediaModel: ObservableObject {
         scannedFiles = 0
         isBusy = true
         stopFlag.reset()
+        stopping = false
         stopped = false
         notice = nil
         progress = WorkProgress(phase: phase)
@@ -164,10 +167,12 @@ final class MediaModel: ObservableObject {
             if !self.stopFlag.isStopped, self.scannedFiles > 0 {
                 self.index.recordScan(of: folder, files: self.scannedFiles)
             }
-            self.index.save()
             let last = self.index.lastScan(of: folder)
+            // Hiện kết quả trước; chỉ mục có thể hàng chục MB nên được lưu ở nền sau đó.
+            defer { Task.detached(priority: .utility) { self.index.save() } }
             await MainActor.run {
                 self.isBusy = false
+                self.stopping = false
                 self.lastScan = last
                 self.refreshVisible()
                 if let overLimit {
@@ -198,6 +203,8 @@ final class MediaModel: ObservableObject {
 
     nonisolated private func report(_ fraction: Double, _ phase: String, _ detail: String = "") {
         Task { @MainActor in
+            // Sau khi bấm Dừng giữ nguyên dòng "Đang dừng…" để người dùng biết lệnh đã được nhận.
+            guard !self.stopping else { return }
             self.progress = WorkProgress(fraction: fraction, phase: phase, detail: detail)
         }
     }
@@ -493,6 +500,10 @@ final class MediaModel: ObservableObject {
     }
 
     func cancel() {
+        guard isBusy, !stopping else { return }
+        stopping = true
+        progress.phase = "Đang dừng…"
+        progress.detail = "Chờ đọc xong các file đang dở và gom kết quả đã quét"
         stopFlag.stop()
         video.cancel()
     }
@@ -688,7 +699,7 @@ struct MediaView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.isBusy, !hasPartialResults {
-            WorkProgressView(progress: model.progress, cancel: { model.cancel() })
+            WorkProgressView(progress: model.progress, stopping: model.stopping, cancel: { model.cancel() })
         } else {
             VStack(spacing: 0) {
                 if model.isBusy { progressBanner }
@@ -712,7 +723,12 @@ struct MediaView: View {
             Text(model.progress.phase).fontWeight(.medium).foregroundStyle(Brand.navy)
             Text(model.progress.detail).foregroundStyle(Brand.muted).lineLimit(1).truncationMode(.middle)
             Spacer()
-            Button("Dừng") { model.cancel() }
+            if model.stopping {
+                ProgressView().controlSize(.small)
+                Text("Đang dừng…").foregroundStyle(Brand.warning)
+            } else {
+                Button("Dừng") { model.cancel() }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -1197,6 +1213,7 @@ private struct Thumbnail: View {
 
 private struct WorkProgressView: View {
     let progress: WorkProgress
+    let stopping: Bool
     let cancel: (() -> Void)?
 
     var body: some View {
@@ -1207,7 +1224,14 @@ private struct WorkProgressView: View {
             Text(progress.detail).font(.callout).foregroundStyle(Brand.muted).lineLimit(1).truncationMode(.middle)
                 .frame(width: 420, height: 18)
             Text("\(Int(progress.fraction * 100))%").font(Brand.heading(13, "SemiBold")).foregroundStyle(Brand.navy)
-            if let cancel { Button("Dừng và xem kết quả đã quét", action: cancel) }
+            if stopping {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Đang dừng, kết quả sẽ hiện ngay khi xong…").foregroundStyle(Brand.warning)
+                }
+            } else if let cancel {
+                Button("Dừng và xem kết quả đã quét", action: cancel)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

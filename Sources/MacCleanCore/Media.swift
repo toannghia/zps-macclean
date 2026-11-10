@@ -238,7 +238,7 @@ public enum DuplicateFinder {
         let prints = zip(images, hashes).compactMap { file, hash in hash.map { (file: file, hash: $0) } }
         progress(0.97, "Đang gom nhóm \(prints.count) ảnh")
         var merged = Set<Int>()
-        for members in cluster(prints) {
+        for members in cluster(prints, stop: stop) {
             var all = members.filter { representative[$0.id] == nil }
             for index in members.compactMap({ representative[$0.id] }) {
                 all += groups[index].files
@@ -273,6 +273,14 @@ public enum DuplicateFinder {
         }
         let fullHash = Dictionary(uniqueKeysWithValues: zip(needFull.map(\.id), full).compactMap { id, hash in hash.map { (id, $0) } })
 
+        // Đọc kích thước để chọn bản tốt nhất: song song và lấy từ chỉ mục, thay vì mở từng file một.
+        let members = byPrint.flatMap { $0 }.filter { $0.kind == .image }
+        let sizes = Parallel.map(members, stop: stop, width: Parallel.diskWidth) { index.dimensions($0) }
+        let pixels = Dictionary(zip(members.map(\.id), sizes).compactMap { id, size in size.map { (id, $0.width * $0.height) } },
+                                uniquingKeysWith: { first, _ in first })
+        // File chưa đọc kịp vì đã bấm Dừng thì tính 0 điểm ảnh, bản giữ được chọn theo dung lượng và tên.
+        let known = Dictionary(byPrint.flatMap { $0 }.map { ($0.id, pixels[$0.id] ?? 0) }, uniquingKeysWith: { first, _ in first })
+
         var groups: [DuplicateGroup] = []
         for members in byPrint {
             let confirmed: [[MediaFile]]
@@ -283,7 +291,7 @@ public enum DuplicateFinder {
                 confirmed = [members]
             }
             for group in confirmed {
-                groups.append(DuplicateGroup(files: group, match: .exact, suggestedKeep: pickKeeper(group)))
+                groups.append(DuplicateGroup(files: group, match: .exact, suggestedKeep: pickKeeper(group, known: known)))
             }
         }
         return groups
@@ -308,8 +316,9 @@ public enum DuplicateFinder {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    static func pickKeeper(_ files: [MediaFile]) -> MediaFile {
-        let pixels = Dictionary(uniqueKeysWithValues: files.map { ($0.id, MediaScanner.pixelCount($0.url)) })
+    /// `known` là số điểm ảnh đã đọc sẵn; file chưa có thì mới mở ra đọc.
+    static func pickKeeper(_ files: [MediaFile], known: [String: Int] = [:]) -> MediaFile {
+        let pixels = Dictionary(uniqueKeysWithValues: files.map { ($0.id, known[$0.id] ?? MediaScanner.pixelCount($0.url)) })
         return files.max { a, b in
             if pixels[a.id] != pixels[b.id] { return pixels[a.id, default: 0] < pixels[b.id, default: 0] }
             if a.size != b.size { return a.size < b.size }
@@ -402,7 +411,7 @@ public enum DuplicateFinder {
     }
 
     /// Gom các ảnh có dấu vân tay gần nhau, ảnh A giống B và B giống C thì cả ba chung nhóm.
-    static func cluster(_ prints: [(file: MediaFile, hash: UInt64)]) -> [[MediaFile]] {
+    static func cluster(_ prints: [(file: MediaFile, hash: UInt64)], stop: StopFlag? = nil) -> [[MediaFile]] {
         var parent = Array(prints.indices)
         func root(_ index: Int) -> Int {
             var index = index
@@ -412,10 +421,22 @@ public enum DuplicateFinder {
             }
             return index
         }
-        for i in prints.indices {
-            for j in (i + 1)..<prints.count
-            where (prints[i].hash ^ prints[j].hash).nonzeroBitCount <= similarThreshold {
-                parent[root(j)] = root(i)
+        // Chia 64 bit thành 6 đoạn: hai dấu vân tay khác nhau không quá 5 bit thì chắc chắn trùng nguyên
+        // ít nhất một đoạn, nên chỉ cần so các ảnh chung đoạn thay vì so mọi cặp. Kết quả giống so mọi cặp.
+        let bands: [(shift: UInt64, width: UInt64)] = [(0, 11), (11, 11), (22, 11), (33, 11), (44, 10), (54, 10)]
+        for band in bands {
+            if stop?.isStopped == true { break }
+            let mask = (UInt64(1) << band.width) - 1
+            let buckets = Dictionary(grouping: prints.indices, by: { (prints[$0].hash >> band.shift) & mask })
+            for members in buckets.values where members.count > 1 {
+                for a in 0 ..< members.count {
+                    for b in (a + 1) ..< members.count {
+                        let i = members[a], j = members[b]
+                        if (prints[i].hash ^ prints[j].hash).nonzeroBitCount <= similarThreshold {
+                            parent[root(j)] = root(i)
+                        }
+                    }
+                }
             }
         }
         return Dictionary(grouping: prints.indices, by: root).values
