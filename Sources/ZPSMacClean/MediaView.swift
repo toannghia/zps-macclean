@@ -42,9 +42,29 @@ final class MediaModel: ObservableObject {
             refreshVisible()
         }
     }
-    @Published var rowFilter = RowFilter.all { didSet { refreshVisible() } }
-    @Published var largeMB = 3 { didSet { refreshVisible() } }
-    @Published var sortOrder = [KeyPathComparator(\MediaRow.size, order: .reverse)] { didSet { refreshVisible() } }
+    @Published var rowFilter = RowFilter.all { didSet { page = 0; refreshVisible() } }
+    @Published var largeMB = 3 { didSet { page = 0; refreshVisible() } }
+    @Published var sortOrder = [KeyPathComparator(\MediaRow.size, order: .reverse)] { didSet { page = 0; refreshVisible() } }
+    /// Trang đang xem, tính từ 0. Bảng chỉ vẽ một trang để danh sách hàng chục nghìn file vẫn nhẹ.
+    @Published var page = 0
+    @Published var pageSize = UserDefaults.standard.integer(forKey: "mediaPageSize") == 0
+        ? 200 : UserDefaults.standard.integer(forKey: "mediaPageSize") {
+        didSet {
+            UserDefaults.standard.set(pageSize, forKey: "mediaPageSize")
+            page = 0
+        }
+    }
+
+    var pageCount: Int { max(1, (visibleRows.count + pageSize - 1) / pageSize) }
+
+    var pageRows: ArraySlice<MediaRow> {
+        let start = min(page * pageSize, visibleRows.count)
+        return visibleRows[start ..< min(start + pageSize, visibleRows.count)]
+    }
+
+    func selectPage() {
+        selection.formUnion(pageRows.map(\.id))
+    }
     @Published var selection = Set<String>()
     /// Hàng đang hiện sau khi lọc và sắp xếp; tính sẵn để bảng hàng chục nghìn dòng không tính lại mỗi lần vẽ.
     @Published private(set) var visibleRows: [MediaRow] = []
@@ -255,6 +275,8 @@ final class MediaModel: ObservableObject {
             case .duplicates: return row.copies > 1
             }
         }.sorted(using: sortOrder)
+        // Danh sách ngắn lại sau khi lọc hoặc xoá thì không để trang hiện tại vượt quá trang cuối.
+        page = min(page, pageCount - 1)
     }
 
     var selectedRows: [MediaRow] { rows.filter { selection.contains($0.id) } }
@@ -717,7 +739,7 @@ struct MediaView: View {
         } else {
             VStack(spacing: 0) {
                 tableBar
-                Table(model.visibleRows, selection: $model.selection, sortOrder: $model.sortOrder) {
+                Table(Array(model.pageRows), selection: $model.selection, sortOrder: $model.sortOrder) {
                     TableColumn("") { row in
                         Toggle("", isOn: Binding(
                             get: { model.selection.contains(row.id) },
@@ -772,13 +794,49 @@ struct MediaView: View {
                 } primaryAction: { ids in
                     preview(ids.first.map { URL(fileURLWithPath: $0) })
                 }
+                .id(model.page)
                 .onKeyPress(.space) {
                     guard let id = model.selection.first else { return .ignored }
                     preview(URL(fileURLWithPath: id))
                     return .handled
                 }
+                pager
             }
         }
+    }
+
+    private var pager: some View {
+        HStack(spacing: 10) {
+            Button { model.page = 0 } label: { Image(systemName: "chevron.left.2") }
+                .disabled(model.page == 0)
+                .help("Trang đầu")
+            Button { model.page -= 1 } label: { Image(systemName: "chevron.left") }
+                .disabled(model.page == 0)
+                .help("Trang trước")
+            Text("Trang \(model.page + 1) / \(model.pageCount)")
+                .monospacedDigit()
+                .foregroundStyle(Brand.navy)
+            Button { model.page += 1 } label: { Image(systemName: "chevron.right") }
+                .disabled(model.page >= model.pageCount - 1)
+                .help("Trang sau")
+            Button { model.page = model.pageCount - 1 } label: { Image(systemName: "chevron.right.2") }
+                .disabled(model.page >= model.pageCount - 1)
+                .help("Trang cuối")
+            Spacer()
+            let first = model.visibleRows.isEmpty ? 0 : model.page * model.pageSize + 1
+            let last = min((model.page + 1) * model.pageSize, model.visibleRows.count)
+            Text("File \(first)–\(last) trong \(model.visibleRows.count)")
+                .foregroundStyle(Brand.muted)
+                .monospacedDigit()
+            Picker("Mỗi trang", selection: $model.pageSize) {
+                ForEach([100, 200, 500, 1000], id: \.self) { Text("\($0) file / trang").tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 150)
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
     }
 
     private var tableBar: some View {
@@ -796,7 +854,8 @@ struct MediaView: View {
             .frame(width: 140)
             Spacer()
             Button("Chọn bản thừa trong nhóm trùng") { model.selectExtraCopies() }
-            Button("Chọn tất cả đang hiện") { model.selectAllVisible() }
+            Button("Chọn cả trang") { model.selectPage() }
+            Button("Chọn tất cả \(model.visibleRows.count) file") { model.selectAllVisible() }
             if !model.selection.isEmpty {
                 Button("Bỏ chọn") { model.selection = [] }
             }
@@ -808,7 +867,7 @@ struct MediaView: View {
     /// Quick Look cho phép dùng phím mũi tên để duyệt các file quanh file đang xem.
     private func preview(_ url: URL?) {
         guard let url else { return }
-        PreviewController.shared.show(url, among: model.visibleRows.map(\.file.url))
+        PreviewController.shared.show(url, among: model.pageRows.map(\.file.url))
     }
 
     private func badge(_ text: String, _ color: Color) -> some View {
