@@ -88,6 +88,16 @@ public enum MediaScanner {
         return formatter.date(from: text)
     }
 
+    /// Kích thước điểm ảnh đọc từ phần đầu file, không giải mã cả ảnh.
+    public static func dimensions(_ url: URL) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        let orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
+        return orientation >= 5 ? (height, width) : (width, height)
+    }
+
     static func pixelCount(_ url: URL) -> Int {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -167,9 +177,26 @@ public enum DuplicateFinder {
         return files.max { a, b in
             if pixels[a.id] != pixels[b.id] { return pixels[a.id, default: 0] < pixels[b.id, default: 0] }
             if a.size != b.size { return a.size < b.size }
-            if a.modified != b.modified { return a.modified > b.modified }
-            return a.url.path.count > b.url.path.count
+            return isLessPreferred(a, b)
         }!
+    }
+
+    /// Hai bản ngang nhau về chất lượng: giữ bản không mang tên bản sao, rồi bản cũ hơn, rồi đường dẫn ngắn hơn.
+    public static func isLessPreferred(_ a: MediaFile, _ b: MediaFile) -> Bool {
+        let copyA = looksLikeCopy(a.url.lastPathComponent)
+        let copyB = looksLikeCopy(b.url.lastPathComponent)
+        if copyA != copyB { return copyA }
+        if a.modified != b.modified { return a.modified > b.modified }
+        if a.url.path.count != b.url.path.count { return a.url.path.count > b.url.path.count }
+        return a.url.path > b.url.path
+    }
+
+    /// Tên kiểu "anh copy.jpg", "anh (1).jpg", "anh - Copy.jpg", "anh-1.jpg".
+    public static func looksLikeCopy(_ name: String) -> Bool {
+        let stem = (name as NSString).deletingPathExtension.lowercased()
+        return stem.hasSuffix(" copy") || stem.contains(" copy ") || stem.hasSuffix("- copy")
+            || stem.range(of: #"(\s\(\d+\)|-\d)$"#, options: .regularExpression) != nil
+            || stem.range(of: #"\scopy\s\d+$"#, options: .regularExpression) != nil
     }
 
     static func sha256(_ url: URL) -> String? {

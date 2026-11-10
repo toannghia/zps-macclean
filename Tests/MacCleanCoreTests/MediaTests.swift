@@ -211,4 +211,21 @@ final class MediaTests: XCTestCase {
         let duration = try await AVURLAsset(url: output).load(.duration)
         XCTAssertEqual(duration.seconds, 1, accuracy: 0.1)
     }
+
+    func testKeeperPrefersOriginalNameOverCopies() throws {
+        let original = try writeImage("Trip/IMG_101.jpg", width: 300, height: 200)
+        for name in ["Zalo/IMG_101 copy.jpg", "Zalo/IMG_101 (1).jpg", "a/IMG_101 copy 2.jpg"] {
+            let target = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: original, to: target)
+        }
+        let group = try XCTUnwrap(DuplicateFinder.find(files(), includeSimilar: false).first)
+        XCTAssertEqual(group.files.count, 4)
+        XCTAssertEqual(group.suggestedKeep.url.lastPathComponent, "IMG_101.jpg")
+        XCTAssertEqual(group.suggestedKeep.url.deletingLastPathComponent().lastPathComponent, "Trip")
+        _ = original
+        XCTAssertTrue(DuplicateFinder.looksLikeCopy("anh - Copy.jpg"))
+        XCTAssertFalse(DuplicateFinder.looksLikeCopy("IMG_2024.jpg"))
+        XCTAssertFalse(DuplicateFinder.looksLikeCopy("Copywriting.png"))
+    }
 }

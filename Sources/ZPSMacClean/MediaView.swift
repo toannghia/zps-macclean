@@ -1,5 +1,6 @@
 import AppKit
 import MacCleanCore
+import QuickLook
 import QuickLookThumbnailing
 import SwiftUI
 
@@ -33,7 +34,13 @@ final class MediaModel: ObservableObject {
     @Published var imageOptions = ImageCompressionOptions()
     @Published var videoQuality = VideoQuality.hevc1080
     @Published var replaceVideos = false
-    @Published var candidates: [MediaFile] = []
+    @Published var rows: [MediaRow] = [] { didSet { refreshVisible() } }
+    @Published var rowFilter = RowFilter.all { didSet { refreshVisible() } }
+    @Published var largeMB = 3 { didSet { refreshVisible() } }
+    @Published var sortOrder = [KeyPathComparator(\MediaRow.size, order: .reverse)] { didSet { refreshVisible() } }
+    @Published var selection = Set<String>()
+    /// Hàng đang hiện sau khi lọc và sắp xếp; tính sẵn để bảng hàng chục nghìn dòng không tính lại mỗi lần vẽ.
+    @Published private(set) var visibleRows: [MediaRow] = []
     @Published var results: [CompressionResult] = []
 
     @Published var scheme = OrganizeScheme.yearMonth
@@ -60,7 +67,8 @@ final class MediaModel: ObservableObject {
     func reset() {
         duplicates = []
         marked = []
-        candidates = []
+        rows = []
+        selection = []
         results = []
         plan = []
         notice = nil
@@ -156,23 +164,103 @@ final class MediaModel: ObservableObject {
         }
     }
 
-    // MARK: Nén ảnh và video
+    // MARK: Danh sách ảnh, video để nén hoặc xoá
+
+    func refreshVisible() {
+        let limit = Int64(largeMB) * 1_000_000
+        visibleRows = rows.filter { row in
+            switch rowFilter {
+            case .all: return true
+            case .large: return row.size >= limit
+            case .duplicates: return row.copies > 1
+            }
+        }.sorted(using: sortOrder)
+    }
+
+    var selectedRows: [MediaRow] { rows.filter { selection.contains($0.id) } }
+
+    /// Số file đã chọn mà không còn bản nào khác chưa chọn, tức sẽ mất hẳn nếu đổ Thùng rác.
+    var selectedLastCopies: Int {
+        let chosen = selectedRows
+        let remaining = Dictionary(grouping: rows.filter { !selection.contains($0.id) && $0.group != nil }, by: { $0.group! })
+        return chosen.filter { row in row.group.map { remaining[$0] == nil } ?? true }.count
+    }
 
     func listCandidates() {
         let kind: MediaKind = tool == .videos ? .video : .image
         run("Đang tìm file") { model in
-            let files = model.listFiles(kind, in: model.scope!.folder, recursive: model.scope!.recursive).sorted { $0.size > $1.size }
+            let files = model.listFiles(kind, in: model.scope!.folder, recursive: model.scope!.recursive)
+            model.report(0.1, "Đang tìm file trùng", "\(files.count) file")
+            let groups = DuplicateFinder.find(files, includeSimilar: false) { fraction, name in
+                model.report(0.1 + 0.4 * fraction, "Đang tìm file trùng", name)
+            }
+            var groupOf: [String: (id: String, count: Int)] = [:]
+            for group in groups {
+                for file in group.files { groupOf[file.id] = (group.id, group.files.count) }
+            }
+            var rows: [MediaRow] = []
+            rows.reserveCapacity(files.count)
+            for (index, file) in files.enumerated() {
+                if index % 100 == 0 {
+                    model.report(0.5 + 0.5 * Double(index) / Double(max(1, files.count)), "Đang đọc kích thước",
+                                 "\(index)/\(files.count)")
+                }
+                let size = kind == .image ? MediaScanner.dimensions(file.url) : nil
+                rows.append(MediaRow(file: file, width: size?.width ?? 0, height: size?.height ?? 0,
+                                     group: groupOf[file.id]?.id, copies: groupOf[file.id]?.count ?? 1))
+            }
             await MainActor.run {
-                model.candidates = files
+                model.rows = rows
+                model.selection = []
                 model.results = []
-                model.notice = files.isEmpty ? "Không có file phù hợp trong thư mục này." : nil
+                model.notice = rows.isEmpty ? "Không có file phù hợp trong thư mục này." : nil
+            }
+        }
+    }
+
+    func selectAllVisible() {
+        selection = Set(visibleRows.map(\.id))
+    }
+
+    /// Chọn các bản thừa trong mỗi nhóm trùng, giữ lại bản lớn nhất.
+    func selectExtraCopies() {
+        let grouped = Dictionary(grouping: rows.filter { $0.group != nil }, by: { $0.group! })
+        selection = Set(grouped.values.flatMap { members in
+            members.sorted { a, b in
+                if a.pixels != b.pixels { return a.pixels > b.pixels }
+                if a.size != b.size { return a.size > b.size }
+                return DuplicateFinder.isLessPreferred(b.file, a.file)
+            }.dropFirst().map(\.id)
+        })
+    }
+
+    func trashSelected() {
+        let chosen = selectedRows
+        run("Đang chuyển vào Thùng rác") { model in
+            var failures: [String] = []
+            var moved = Set<String>()
+            for (index, row) in chosen.enumerated() {
+                model.report(Double(index) / Double(max(1, chosen.count)), "Đang chuyển vào Thùng rác", row.name)
+                do {
+                    try MediaFiles.trash(row.file.url)
+                    moved.insert(row.id)
+                } catch {
+                    failures.append("\(row.name): \(error.localizedDescription)")
+                }
+            }
+            let size = chosen.filter { moved.contains($0.id) }.reduce(Int64(0)) { $0 + $1.size }
+            await MainActor.run {
+                model.rows = MediaRow.recount(model.rows.filter { !moved.contains($0.id) })
+                model.selection = []
+                model.notice = "Đã chuyển \(moved.count) file (\(formatBytes(size))) vào Thùng rác."
+                    + (failures.isEmpty ? " Đổ Thùng rác để giải phóng dung lượng." : " \(failures.count) file lỗi: \(failures[0])")
             }
         }
     }
 
     func compressImages() {
         guard let folder else { return }
-        let files = candidates
+        let files = selectedRows.map(\.file)
         let options = imageOptions
         run("Đang nén ảnh") { model in
             var results: [CompressionResult] = []
@@ -188,7 +276,7 @@ final class MediaModel: ObservableObject {
 
     func compressVideos() {
         guard let folder else { return }
-        let files = candidates
+        let files = selectedRows.map(\.file)
         let quality = videoQuality
         let replace = replaceVideos
         let compressor = video
@@ -279,6 +367,7 @@ final class MediaModel: ObservableObject {
 struct MediaView: View {
     @StateObject private var model = MediaModel()
     @State private var confirmation: Confirmation?
+    @State private var previewURL: URL?
 
     private struct Confirmation: Identifiable {
         let id = UUID()
@@ -314,6 +403,10 @@ struct MediaView: View {
                     Text("Ảnh & Video").font(Brand.heading(13, "SemiBold")).foregroundStyle(.white.opacity(0.75))
                     Text(model.folder?.lastPathComponent ?? "Chưa chọn thư mục")
                         .font(Brand.heading(24)).foregroundStyle(.white).lineLimit(1).truncationMode(.middle)
+                    if let folder = model.folder {
+                        Text(folder.path).font(.caption).foregroundStyle(.white.opacity(0.7))
+                            .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    }
                 }
                 Spacer()
                 Button(model.folder == nil ? "Chọn thư mục…" : "Đổi thư mục…") { model.chooseFolder() }
@@ -439,43 +532,161 @@ struct MediaView: View {
 
     @ViewBuilder private var compressionList: some View {
         if !model.results.isEmpty {
-            List(model.results) { result in
+            VStack(spacing: 0) {
                 HStack {
-                    Image(systemName: result.output == nil ? "minus.circle" : "checkmark.circle.fill")
-                        .foregroundStyle(result.output == nil ? Brand.muted : Risk.safe.color)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(result.source.lastPathComponent).foregroundStyle(Brand.navy).lineLimit(1)
-                        Text(result.skipped ?? result.output?.path ?? "").font(.caption).foregroundStyle(Brand.muted)
-                            .lineLimit(1).truncationMode(.middle)
-                    }
+                    Text("Kết quả nén").font(Brand.heading(14)).foregroundStyle(Brand.navy)
                     Spacer()
-                    if result.output != nil {
-                        Text("\(formatBytes(result.before)) → \(formatBytes(result.after))").monospacedDigit()
-                        Button { NSWorkspace.shared.activateFileViewerSelecting([result.output!]) } label: {
-                            Image(systemName: "magnifyingglass")
+                    Button("Quay lại danh sách") { model.listCandidates() }
+                }
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                List(model.results) { result in
+                    HStack {
+                        Image(systemName: result.output == nil ? "minus.circle" : "checkmark.circle.fill")
+                            .foregroundStyle(result.output == nil ? Brand.muted : Risk.safe.color)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(result.source.lastPathComponent).foregroundStyle(Brand.navy).lineLimit(1)
+                            Text(result.skipped ?? result.output?.path ?? "").font(.caption).foregroundStyle(Brand.muted)
+                                .lineLimit(1).truncationMode(.middle)
                         }
-                        .buttonStyle(.borderless)
-                    } else {
-                        Text(formatBytes(result.before)).monospacedDigit().foregroundStyle(Brand.muted)
+                        Spacer()
+                        if let output = result.output {
+                            Text("\(formatBytes(result.before)) → \(formatBytes(result.after))").monospacedDigit()
+                            Button { NSWorkspace.shared.activateFileViewerSelecting([output]) } label: {
+                                Image(systemName: "magnifyingglass")
+                            }
+                            .buttonStyle(.borderless)
+                        } else {
+                            Text(formatBytes(result.before)).monospacedDigit().foregroundStyle(Brand.muted)
+                        }
                     }
                 }
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
             }
-            .listStyle(.inset)
-            .scrollContentBackground(.hidden)
-        } else if model.candidates.isEmpty {
-            placeholder(model.tool == .videos ? "Nén video bằng HEVC" : "Nén ảnh JPEG, HEIC",
-                        "Kết quả lưu vào thư mục \"\(MediaScanner.outputFolderName)\" trong thư mục đã chọn, bản gốc giữ nguyên trừ khi bạn chọn ghi đè.")
+        } else if model.rows.isEmpty {
+            placeholder(model.tool == .videos ? "Video trong thư mục" : "Ảnh trong thư mục",
+                        "Liệt kê toàn bộ file kèm nhãn Trùng và Lớn, sau đó chọn file để nén hoặc chuyển vào Thùng rác.")
         } else {
-            List(model.candidates.prefix(500)) { file in
-                HStack {
-                    Text(file.url.lastPathComponent).foregroundStyle(Brand.navy).lineLimit(1)
-                    Spacer()
-                    Text(formatBytes(file.size)).monospacedDigit().foregroundStyle(Brand.muted)
+            VStack(spacing: 0) {
+                tableBar
+                Table(model.visibleRows, selection: $model.selection, sortOrder: $model.sortOrder) {
+                    TableColumn("") { row in
+                        Toggle("", isOn: Binding(
+                            get: { model.selection.contains(row.id) },
+                            set: { on in
+                                if on { model.selection.insert(row.id) } else { model.selection.remove(row.id) }
+                            }))
+                            .toggleStyle(.checkbox)
+                            .labelsHidden()
+                    }
+                    .width(24)
+                    TableColumn("") { row in
+                        Button { previewURL = row.file.url } label: { Thumbnail(url: row.file.url) }
+                            .buttonStyle(.plain)
+                            .help("Xem trước")
+                    }
+                    .width(44)
+                    TableColumn("Tên", value: \.name) { row in
+                        Text(row.name).foregroundStyle(Brand.navy).lineLimit(1).help(row.file.url.path)
+                    }
+                    TableColumn("Thư mục", value: \.folder) { row in
+                        Text(relative(row.file.url.deletingLastPathComponent()))
+                            .foregroundStyle(Brand.muted).lineLimit(1).truncationMode(.middle)
+                            .help(row.file.url.deletingLastPathComponent().path)
+                    }
+                    TableColumn("Kích thước", value: \.pixels) { row in
+                        Text(row.pixels > 0 ? "\(row.width) × \(row.height)" : "—").monospacedDigit().foregroundStyle(Brand.muted)
+                    }
+                    .width(min: 90, ideal: 110)
+                    TableColumn("Dung lượng", value: \.size) { row in
+                        Text(formatBytes(row.size)).monospacedDigit().foregroundStyle(Brand.navy)
+                    }
+                    .width(min: 80, ideal: 90)
+                    TableColumn("Ghi chú") { row in
+                        HStack(spacing: 4) {
+                            if row.copies > 1 { badge("Trùng ×\(row.copies)", Brand.warning) }
+                            if row.size >= Int64(model.largeMB) * 1_000_000 { badge("Lớn", Risk.review.color) }
+                        }
+                    }
+                    .width(min: 110, ideal: 130)
                 }
+                .contextMenu(forSelectionType: String.self) { ids in
+                    Button("Xem trước") { previewURL = ids.first.map { URL(fileURLWithPath: $0) } }
+                    Button("Hiện trong Finder") { reveal(ids) }
+                    Button("Nén") {
+                        model.selection = ids
+                        startCompression()
+                    }
+                    Button("Chuyển vào Thùng rác") {
+                        model.selection = ids
+                        confirmTrash()
+                    }
+                } primaryAction: { ids in
+                    previewURL = ids.first.map { URL(fileURLWithPath: $0) }
+                }
+                .onKeyPress(.space) {
+                    guard let id = model.selection.first else { return .ignored }
+                    previewURL = URL(fileURLWithPath: id)
+                    return .handled
+                }
+                // Quick Look cho phép dùng phím mũi tên để duyệt các file đang hiện.
+                .quickLookPreview($previewURL, in: model.visibleRows.map(\.file.url))
             }
-            .listStyle(.inset)
-            .scrollContentBackground(.hidden)
         }
+    }
+
+    private var tableBar: some View {
+        HStack(spacing: 12) {
+            Picker("Lọc", selection: $model.rowFilter) {
+                ForEach(RowFilter.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 300)
+            Picker("Từ", selection: $model.largeMB) {
+                ForEach([1, 2, 3, 5, 10, 20, 50], id: \.self) { Text("Lớn từ \($0) MB").tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 140)
+            Spacer()
+            Button("Chọn bản thừa trong nhóm trùng") { model.selectExtraCopies() }
+            Button("Chọn tất cả đang hiện") { model.selectAllVisible() }
+            if !model.selection.isEmpty {
+                Button("Bỏ chọn") { model.selection = [] }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private func badge(_ text: String, _ color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .foregroundStyle(color)
+            .background(color.opacity(0.12), in: Capsule())
+    }
+
+    private func reveal(_ ids: Set<String>) {
+        NSWorkspace.shared.activateFileViewerSelecting(ids.map { URL(fileURLWithPath: $0) })
+    }
+
+    private func startCompression() {
+        let replacing = model.tool == .videos ? model.replaceVideos : model.imageOptions.replaceOriginal
+        let run = model.tool == .videos ? model.compressVideos : model.compressImages
+        guard replacing else { return run() }
+        confirm("Ghi đè \(model.selection.count) bản gốc?",
+                "Bản gốc được chuyển vào Thùng rác khi bản nén nhỏ hơn. Bản nén có mất chi tiết, không khôi phục được từ bản nén.",
+                "Nén và ghi đè", run)
+    }
+
+    private func confirmTrash() {
+        let last = model.selectedLastCopies
+        let size = model.selectedRows.reduce(Int64(0)) { $0 + $1.size }
+        let warning = last > 0 ? "\(last) file không còn bản nào khác trong thư mục, sẽ mất hẳn nếu đổ Thùng rác." : "Mọi file đã chọn đều còn bản khác."
+        confirm("Chuyển \(model.selection.count) file vào Thùng rác?",
+                "Dọn được \(formatBytes(size)) sau khi đổ Thùng rác. \(warning)",
+                "Chuyển vào Thùng rác", model.trashSelected)
     }
 
     @ViewBuilder private var organizeList: some View {
@@ -508,8 +719,11 @@ struct MediaView: View {
         case .duplicates:
             return model.duplicates.isEmpty ? "" : "\(model.duplicates.count) nhóm trùng. Bấm vào ảnh để đổi bản giữ lại."
         case .images, .videos:
-            let total = model.candidates.reduce(Int64(0)) { $0 + $1.size }
-            return model.candidates.isEmpty ? "" : "\(model.candidates.count) file, tổng \(formatBytes(total))."
+            guard !model.rows.isEmpty, model.results.isEmpty else { return "" }
+            let shown = model.visibleRows.reduce(Int64(0)) { $0 + $1.size }
+            let chosen = model.selectedRows.reduce(Int64(0)) { $0 + $1.size }
+            return "Đang hiện \(model.visibleRows.count)/\(model.rows.count) file, \(formatBytes(shown))."
+                + (model.selection.isEmpty ? " Chọn file để nén hoặc xoá." : " Đã chọn \(model.selection.count) file, \(formatBytes(chosen)).")
         case .organize:
             return model.plan.isEmpty ? "" : "\(model.plan.count) file sẽ được \(model.copyInsteadOfMove ? "chép" : "chuyển")."
         }
@@ -529,20 +743,10 @@ struct MediaView: View {
                 .disabled(disabled)
             }
         case .images, .videos:
-            Button("Liệt kê file") { model.listCandidates() }.disabled(disabled)
-            if !model.candidates.isEmpty, model.results.isEmpty {
-                let replacing = model.tool == .videos ? model.replaceVideos : model.imageOptions.replaceOriginal
-                primary("Nén \(model.candidates.count) file") {
-                    let run = model.tool == .videos ? model.compressVideos : model.compressImages
-                    if replacing {
-                        confirm("Ghi đè \(model.candidates.count) bản gốc?",
-                                "Bản gốc được chuyển vào Thùng rác khi bản nén nhỏ hơn. Ảnh nén có mất chi tiết, không khôi phục được từ bản nén.",
-                                "Nén và ghi đè", run)
-                    } else {
-                        run()
-                    }
-                }
-                .disabled(disabled)
+            Button(model.rows.isEmpty ? "Liệt kê file" : "Quét lại") { model.listCandidates() }.disabled(disabled)
+            if !model.selection.isEmpty, model.results.isEmpty {
+                Button("Chuyển \(model.selection.count) file vào Thùng rác") { confirmTrash() }.disabled(disabled)
+                primary("Nén \(model.selection.count) file") { startCompression() }.disabled(disabled)
             }
         case .organize:
             if let last = model.lastOrganize, model.plan.isEmpty {
@@ -599,6 +803,61 @@ struct MediaView: View {
     private func relative(_ url: URL) -> String {
         guard let root = model.folder?.path, url.path.hasPrefix(root) else { return url.path }
         return String(url.path.dropFirst(root.count + 1))
+    }
+}
+
+enum RowFilter: String, CaseIterable, Identifiable {
+    case all = "Tất cả"
+    case large = "Dung lượng lớn"
+    case duplicates = "Bị trùng"
+    var id: String { rawValue }
+}
+
+/// Một dòng trong bảng ảnh hoặc video.
+struct MediaRow: Identifiable, Sendable {
+    let file: MediaFile
+    let width: Int
+    let height: Int
+    /// Nhóm file giống hệt nhau, nil nếu không trùng với file nào.
+    let group: String?
+    var copies: Int
+
+    var id: String { file.id }
+    var name: String { file.url.lastPathComponent }
+    var folder: String { file.url.deletingLastPathComponent().path }
+    var size: Int64 { file.size }
+    var pixels: Int { width * height }
+
+    /// Đếm lại số bản trong nhóm sau khi có file bị chuyển đi.
+    static func recount(_ rows: [MediaRow]) -> [MediaRow] {
+        let counts = Dictionary(grouping: rows.compactMap(\.group), by: { $0 }).mapValues(\.count)
+        return rows.map { row in
+            var row = row
+            row.copies = row.group.flatMap { counts[$0] } ?? 1
+            return row
+        }
+    }
+}
+
+private struct Thumbnail: View {
+    let url: URL
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().scaledToFill()
+            } else {
+                RoundedRectangle(cornerRadius: 4).fill(Brand.surface)
+            }
+        }
+        .frame(width: 32, height: 32)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .task(id: url) {
+            let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 64, height: 64),
+                                                       scale: 2, representationTypes: .thumbnail)
+            image = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).nsImage
+        }
     }
 }
 
