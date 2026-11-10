@@ -79,7 +79,7 @@ public enum Guides {
             GuideSection(title: "Ảnh & Video", guides: [
                 ItemGuide(name: "Ảnh trùng",
                           what: "Tìm file giống hệt nhau, và tuỳ chọn tìm ảnh nhìn giống nhau như bản đã nén lại hoặc đổi kích thước. File dưới 256 MB được so từng byte; file lớn hơn như video dài được so dung lượng cùng 32 đoạn rải đều khắp file, để không phải đọc hết hàng chục GB.",
-                          ifDeleted: "File được chuyển vào Thùng rác, chưa mất cho tới khi đổ Thùng rác. Mỗi nhóm luôn giữ ít nhất một bản.",
+                          ifDeleted: "App không chọn sẵn file nào; chỉ file bạn bấm chọn mới được chuyển vào Thùng rác, và chưa mất cho tới khi đổ Thùng rác. Mỗi nhóm luôn giữ ít nhất một bản.",
                           restore: "Mở Thùng rác, chọn file rồi bấm Đưa trở lại.",
                           advice: "App tự dừng quét nếu dùng quá nhiều bộ nhớ, kết quả đến lúc đó vẫn được giữ. Nhóm Giống hệt nhau xoá an toàn. Nhóm Nhìn giống nhau nên xem kỹ, vì ảnh chụp liên tiếp cũng có thể bị xếp chung."),
                 ItemGuide(name: "Nén ảnh",

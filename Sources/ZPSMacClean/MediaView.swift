@@ -212,12 +212,26 @@ final class MediaModel: ObservableObject {
             let stopped = model.stopFlag.isStopped
             await MainActor.run {
                 model.duplicates = groups
-                model.marked = Set(groups.flatMap { group in group.files.filter { $0 != group.suggestedKeep }.map(\.id) })
+                // Không chọn sẵn gì: chỉ file người dùng tự bấm chọn mới bị chuyển vào Thùng rác.
+                model.marked = []
                 model.stopped = stopped
                 model.notice = stopped ? "Đã dừng. Đang hiện \(groups.count) nhóm trùng tìm được trước khi dừng."
                     : groups.isEmpty ? "Không tìm thấy ảnh hoặc video trùng." : nil
             }
         }
+    }
+
+    /// Đánh dấu mọi bản trừ bản tốt nhất của nhóm.
+    func markExtras(in group: DuplicateGroup) {
+        marked.formUnion(group.files.filter { $0 != group.suggestedKeep }.map(\.id))
+    }
+
+    func unmark(_ group: DuplicateGroup) {
+        marked.subtract(group.files.map(\.id))
+    }
+
+    func markExtrasEverywhere() {
+        for group in duplicates { markExtras(in: group) }
     }
 
     func toggle(_ file: MediaFile, in group: DuplicateGroup) {
@@ -672,7 +686,7 @@ struct MediaView: View {
 
     @ViewBuilder private var duplicateList: some View {
         if model.duplicates.isEmpty {
-            placeholder("Tìm ảnh và video trùng nhau", "Bản đẹp nhất của mỗi nhóm được giữ lại, các bản khác vào Thùng rác.")
+            placeholder("Tìm ảnh và video trùng nhau", "Tìm xong không có file nào bị chọn sẵn. Bạn tự chọn bản cần xoá; file đã chọn vào Thùng rác, mỗi nhóm luôn giữ ít nhất một bản.")
         } else {
             List(model.duplicates) { group in
                 VStack(alignment: .leading, spacing: 8) {
@@ -683,12 +697,21 @@ struct MediaView: View {
                         Text("\(group.files.count) file").font(.caption).foregroundStyle(Brand.muted)
                         Spacer()
                         Text("Dọn được \(formatBytes(group.reclaimable))").font(.caption).foregroundStyle(Brand.muted)
+                        if group.files.contains(where: { model.marked.contains($0.id) }) {
+                            Button("Bỏ chọn") { model.unmark(group) }.font(.caption)
+                        }
+                        Button("Chọn bản thừa") { model.markExtras(in: group) }.font(.caption)
                     }
+                    .buttonStyle(.link)
                     ScrollView(.horizontal) {
                         HStack(alignment: .top, spacing: 12) {
                             ForEach(group.files) { file in
-                                DuplicateTile(file: file, isKept: !model.marked.contains(file.id),
-                                              isSuggested: file == group.suggestedKeep) { model.toggle(file, in: group) }
+                                DuplicateTile(file: file, isMarked: model.marked.contains(file.id),
+                                              isSuggested: file == group.suggestedKeep,
+                                              toggle: { model.toggle(file, in: group) },
+                                              preview: {
+                                                  PreviewController.shared.show(file.url, among: group.files.map(\.url))
+                                              })
                             }
                         }
                     }
@@ -928,7 +951,10 @@ struct MediaView: View {
     private var summary: String {
         switch model.tool {
         case .duplicates:
-            return model.duplicates.isEmpty ? "" : "\(model.duplicates.count) nhóm trùng. Bấm vào ảnh để đổi bản giữ lại."
+            guard !model.duplicates.isEmpty else { return "" }
+            return model.marked.isEmpty
+                ? "\(model.duplicates.count) nhóm trùng. Chưa chọn file nào; tick ô Chọn để xoá ở file cần xoá, bấm ảnh để xem trước."
+                : "\(model.duplicates.count) nhóm trùng. Đã chọn \(model.marked.count) file, \(formatBytes(model.markedSize))."
         case .images, .videos:
             guard !model.rows.isEmpty, model.results.isEmpty else { return "" }
             let shown = model.visibleRows.reduce(Int64(0)) { $0 + $1.size }
@@ -945,6 +971,13 @@ struct MediaView: View {
         switch model.tool {
         case .duplicates:
             Button("Tìm trùng") { model.findDuplicates() }.disabled(disabled)
+            if !model.duplicates.isEmpty {
+                if model.marked.isEmpty {
+                    Button("Chọn bản thừa ở mọi nhóm") { model.markExtrasEverywhere() }.disabled(disabled)
+                } else {
+                    Button("Bỏ chọn tất cả") { model.marked = [] }.disabled(disabled)
+                }
+            }
             if !model.marked.isEmpty {
                 primary("Chuyển \(model.marked.count) file vào Thùng rác") {
                     confirm("Chuyển \(model.marked.count) file vào Thùng rác?",
@@ -1098,16 +1131,18 @@ private struct WorkProgressView: View {
     }
 }
 
+/// Một file trong nhóm trùng. Bấm ảnh chỉ để xem trước; muốn xoá phải tick ô riêng.
 private struct DuplicateTile: View {
     let file: MediaFile
-    let isKept: Bool
+    let isMarked: Bool
     let isSuggested: Bool
     let toggle: () -> Void
+    let preview: () -> Void
     @State private var thumbnail: NSImage?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button(action: toggle) {
+            Button(action: preview) {
                 ZStack(alignment: .topTrailing) {
                     Group {
                         if let thumbnail {
@@ -1118,19 +1153,27 @@ private struct DuplicateTile: View {
                     }
                     .frame(width: 150, height: 110)
                     .clipped()
-                    .opacity(isKept ? 1 : 0.45)
-                    Text(isKept ? "Giữ" : "Xoá")
-                        .font(.caption2.weight(.bold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .foregroundStyle(.white)
-                        .background(isKept ? Risk.safe.color : Brand.warning, in: Capsule())
-                        .padding(6)
+                    .opacity(isMarked ? 0.45 : 1)
+                    if isMarked {
+                        Text("Sẽ xoá")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .foregroundStyle(.white)
+                            .background(Brand.warning, in: Capsule())
+                            .padding(6)
+                    }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(isKept ? Risk.safe.color : Brand.line, lineWidth: 2))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(isMarked ? Brand.warning : Brand.line, lineWidth: isMarked ? 2 : 1))
             }
             .buttonStyle(.plain)
-            Text(file.url.lastPathComponent).font(.caption).foregroundStyle(Brand.navy).lineLimit(1).frame(width: 150, alignment: .leading)
+            .help("Xem trước")
+            Toggle("Chọn để xoá", isOn: Binding(get: { isMarked }, set: { _ in toggle() }))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .foregroundStyle(isMarked ? Brand.warning : Brand.slate)
+            Text(file.url.lastPathComponent).font(.caption).foregroundStyle(Brand.navy).lineLimit(1)
+                .frame(width: 150, alignment: .leading).help(file.url.path)
             Text(formatBytes(file.size) + (isSuggested ? " · bản tốt nhất" : ""))
                 .font(.caption2).foregroundStyle(Brand.muted)
             Button("Hiện trong Finder") { NSWorkspace.shared.activateFileViewerSelecting([file.url]) }

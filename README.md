@@ -27,7 +27,7 @@ ZPS MacClean dọn rác do công cụ lập trình và công cụ AI để lại
 - Thư mục tái tạo được trong dự án lâu không đụng tới: `node_modules`, `.next`, `build`, `Pods`, `target`, `.venv` và các thư mục tương tự
 
 **Ảnh & Video** (trên thư mục bạn chọn, không đụng tới thư viện Photos)
-- Tìm ảnh và video trùng: giống hệt từng byte, hoặc nhìn giống nhau như bản đã nén lại, đổi cỡ. Mỗi nhóm luôn giữ bản tốt nhất, các bản khác vào Thùng rác.
+- Tìm ảnh và video trùng: giống hệt từng byte, hoặc nhìn giống nhau như bản đã nén lại, đổi cỡ. Không chọn sẵn file nào; bạn tự chọn bản cần xoá hoặc bấm Chọn bản thừa, mỗi nhóm luôn giữ lại ít nhất một bản và file xoá vào Thùng rác.
 - Nén ảnh JPEG, HEIC: chỉnh chất lượng, thu nhỏ, đổi sang HEIC. Giữ EXIF như ngày chụp, vị trí.
 - Sắp xếp ảnh theo ngày chụp vào thư mục Năm / Tháng, có xem trước và hoàn tác.
 - Nén video bằng HEVC hoặc H.264, giữ ngày quay.
