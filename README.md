@@ -30,7 +30,7 @@ ZPS MacClean dọn rác do công cụ lập trình và công cụ AI để lại
 - Tìm ảnh và video trùng: giống hệt từng byte, hoặc nhìn giống nhau như bản đã nén lại, đổi cỡ. Không chọn sẵn file nào; bạn tự chọn bản cần xoá hoặc bấm Chọn bản thừa, mỗi nhóm luôn giữ lại ít nhất một bản và file xoá vào Thùng rác.
 - Nén ảnh JPEG, HEIC: chỉnh chất lượng, thu nhỏ, đổi sang HEIC. Giữ EXIF như ngày chụp, vị trí.
 - Sắp xếp ảnh theo ngày chụp vào thư mục Năm / Tháng, có xem trước và hoàn tác.
-- Nén video bằng HEVC hoặc H.264, giữ ngày quay.
+- Nén video theo bitrate như các nền tảng video, bằng bộ mã hoá phần cứng của Mac, ra MP4. Ví dụ một video iPhone 4K 60 khung hình, 1,8 GB còn 126 MB ở mức Cân bằng 1080p (54 giây) hoặc 64 MB ở mức Nhỏ gọn 720p. Giữ ngày quay, chiều quay, âm thanh và màu HDR; video đã nhẹ được giữ nguyên.
 - Mặc định bản nén nằm trong thư mục `ZPS Đã nén`, bản gốc giữ nguyên. Khi chọn ghi đè, bản gốc vào Thùng rác.
 
 **Quản lý tiến trình**

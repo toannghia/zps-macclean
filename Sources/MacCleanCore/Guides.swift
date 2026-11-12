@@ -93,10 +93,10 @@ public enum Guides {
                           restore: "Bấm Hoàn tác ngay sau khi xếp. Danh sách đã chuyển cũng được lưu trong ~/Library/Logs/ZPS-MacClean.",
                           advice: "Bấm Xem trước để kiểm tra. Không chọn thư mục mà phần mềm khác đang quản lý theo đường dẫn cố định."),
                 ItemGuide(name: "Nén video",
-                          what: "Nén lại video bằng HEVC hoặc H.264 qua bộ mã hoá của macOS, giữ ngày quay và vị trí.",
+                          what: "Nén lại video với bitrate như các nền tảng video, bằng bộ mã hoá phần cứng của Mac, ra file MP4. Dung lượng giảm vì bitrate thấp hơn, không phải vì đổi đuôi: video iPhone 4K thường 50–100 Mbps, bản 1080p cân bằng chỉ khoảng 4–6 Mbps. Giữ ngày quay, vị trí, chiều quay và màu HDR.",
                           ifDeleted: "Mặc định bản gốc giữ nguyên. Khi chọn ghi đè, bản gốc vào Thùng rác nếu bản nén nhỏ hơn.",
                           restore: "Lấy lại bản gốc trong Thùng rác.",
-                          advice: "HEVC 1080p hợp cho video điện thoại. Chọn H.264 nếu cần mở trên máy cũ hoặc Windows."),
+                          advice: "Cân bằng 1080p hợp cho hầu hết video điện thoại: một video 4K 1,8 GB còn khoảng 126 MB mà xem bình thường khó thấy khác. Nhỏ gọn 720p nhẹ hơn nữa nhưng mềm hình hơn. Chọn Tương thích H.264 nếu cần mở trên máy cũ hoặc Windows. Video đã ở bitrate thấp sẽ được giữ nguyên."),
             ]),
             GuideSection(title: "Tiến trình", guides: [
                 ItemGuide(name: "Tắt và Buộc tắt",

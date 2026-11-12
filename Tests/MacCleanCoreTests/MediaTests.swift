@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import VideoToolbox
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -203,7 +204,7 @@ final class MediaTests: XCTestCase {
     func testVideoCompressionWritesSmallerCopy() async throws {
         let url = try await writeVideo("clip.mov")
         let file = try XCTUnwrap(files().first)
-        let result = await VideoCompressor().compress(file, quality: .h264720, replaceOriginal: false, root: root) { _ in }
+        let result = await VideoCompressor().compress(file, quality: .compact, replaceOriginal: false, root: root) { _ in }
         let output = try XCTUnwrap(result.output, result.skipped ?? "")
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
@@ -340,5 +341,96 @@ final class MediaTests: XCTestCase {
         let banded = Set(DuplicateFinder.cluster(prints).map { Set($0.map(\.id)) })
         XCTAssertEqual(banded, pairwise())
         XCTAssertGreaterThanOrEqual(banded.count, 50)
+    }
+
+    /// Chỉ chạy khi trỏ ZPS_VIDEO_SAMPLE tới một video thật; bản gốc chỉ được đọc, kết quả ghi vào thư mục tạm.
+    func testRealVideoSampleShrinks() async throws {
+        guard let path = ProcessInfo.processInfo.environment["ZPS_VIDEO_SAMPLE"] else {
+            throw XCTSkip("Không có video mẫu")
+        }
+        let url = URL(fileURLWithPath: path)
+        let size = Int64(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+        let file = MediaFile(url: url, size: size, kind: .video, modified: Date())
+        for quality in [VideoQuality.balanced, .compact] {
+            let plan = try await VideoCompressor.plan(for: url, quality: quality)
+            let started = Date()
+            let result = await VideoCompressor().compress(file, quality: quality, replaceOriginal: false, root: root) { _ in }
+            let output = try XCTUnwrap(result.output, result.skipped ?? "")
+            let asset = AVURLAsset(url: output)
+            let track = try await XCTUnwrapAsync(try await asset.loadTracks(withMediaType: .video).first)
+            let (natural, transform) = try await track.load(.naturalSize, .preferredTransform)
+            let duration = try await asset.load(.duration).seconds
+            let audio = try await asset.loadTracks(withMediaType: .audio).count
+            print("SAMPLE \(quality.rawValue): \(size / 1_000_000) MB -> \(result.after / 1_000_000) MB " +
+                  "(dự kiến \(plan.estimatedBytes / 1_000_000) MB) trong \(Int(Date().timeIntervalSince(started)))s, " +
+                  "\(Int(natural.width))x\(Int(natural.height)) xoay=\(transform.b != 0) \(Int(duration))s audio=\(audio) HDR=\(plan.isHDR)")
+            XCTAssertLessThan(result.after, size / 5)
+            XCTAssertEqual(min(natural.width, natural.height), CGFloat(quality.maxShortSide ?? 0), accuracy: 2)
+            XCTAssertEqual(duration, plan.duration, accuracy: 0.5)
+            XCTAssertEqual(audio, 1)
+            try? FileManager.default.copyItem(at: output, to: FileManager.default.temporaryDirectory
+                .appendingPathComponent("zps-sample-\(quality.maxShortSide ?? 0).mp4"))
+        }
+    }
+
+    private func XCTUnwrapAsync<T>(_ value: T?) async throws -> T { try XCTUnwrap(value) }
+
+    /// Video HDR HLG 10 bit như iPhone quay, 1920x1080, bitrate cao để bản nén chắc chắn nhỏ hơn.
+    private func writeHDRVideo(_ name: String) async throws -> URL {
+        let url = root.appendingPathComponent(name)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: 1920, AVVideoHeightKey: 1080,
+            AVVideoColorPropertiesKey: [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                                        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                                        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020],
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 60_000_000,
+                                              AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String],
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: 1920, kCVPixelBufferHeightKey as String: 1080,
+        ])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        var generator = SystemRandomNumberGenerator()
+        for frame in 0..<30 {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(5)) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &buffer)
+            let pixels = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(pixels, [])
+            for plane in 0..<CVPixelBufferGetPlaneCount(pixels) {
+                let base = CVPixelBufferGetBaseAddressOfPlane(pixels, plane)!.assumingMemoryBound(to: UInt16.self)
+                let count = CVPixelBufferGetBytesPerRowOfPlane(pixels, plane) * CVPixelBufferGetHeightOfPlane(pixels, plane) / 2
+                for index in 0..<count { base[index] = UInt16.random(in: 64...940, using: &generator) << 6 }
+            }
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed)
+        return url
+    }
+
+    func testHDRVideoKeepsHLGAndTenBits() async throws {
+        let url = try await writeHDRVideo("hdr.mov")
+        let plan = try await VideoCompressor.plan(for: url, quality: .compact)
+        XCTAssertTrue(plan.isHDR)
+        let file = try XCTUnwrap(files().first)
+        let result = await VideoCompressor().compress(file, quality: .compact, replaceOriginal: false, root: root) { _ in }
+        let output = try XCTUnwrap(result.output, result.skipped ?? "")
+        let tracks = try await AVURLAsset(url: output).loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let formats = try await track.load(.formatDescriptions)
+        let format = try XCTUnwrap(formats.first)
+        let transfer = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        XCTAssertEqual(transfer, kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String, "Màu HDR phải được giữ")
+        let depth = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_BitsPerComponent) as? Int
+        XCTAssertEqual(depth, 10)
+        let natural = try await track.load(.naturalSize)
+        XCTAssertEqual(natural.height, 720, accuracy: 2)
     }
 }

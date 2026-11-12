@@ -44,7 +44,38 @@ final class MediaModel: ObservableObject {
     @Published var marked = Set<String>()
 
     @Published var imageOptions = ImageCompressionOptions()
-    @Published var videoQuality = VideoQuality.hevc1080
+    @Published var videoQuality = VideoQuality.balanced
+    /// Dung lượng dự kiến của các video đang chọn sau khi nén, cùng số video sẽ được bỏ qua vì đã nhẹ.
+    @Published var videoEstimate: (bytes: Int64, skipped: Int, counted: Int)?
+    private var estimateTask: Task<Void, Never>?
+
+    /// Đọc thông số các video đã chọn ở nền để ước tính; chỉ lấy tối đa 300 file cho nhanh.
+    func refreshVideoEstimate() {
+        estimateTask?.cancel()
+        videoEstimate = nil
+        guard tool == .videos, !selection.isEmpty else { return }
+        let urls = selectedRows.prefix(300).map(\.file)
+        let quality = videoQuality
+        estimateTask = Task.detached(priority: .utility) { [weak self] in
+            var bytes: Int64 = 0
+            var skipped = 0
+            for file in urls {
+                if Task.isCancelled { return }
+                guard let plan = try? await VideoCompressor.plan(for: file.url, quality: quality) else {
+                    skipped += 1
+                    continue
+                }
+                if plan.sourceBitrate > 0, Double(plan.bitrate) > plan.sourceBitrate * 0.7 {
+                    skipped += 1
+                    bytes += file.size
+                } else {
+                    bytes += min(plan.estimatedBytes, file.size)
+                }
+            }
+            let result = (bytes, skipped, urls.count)
+            await MainActor.run { self?.videoEstimate = result }
+        }
+    }
     @Published var replaceVideos = false
     @Published var rows: [MediaRow] = [] {
         didSet {
@@ -628,6 +659,8 @@ struct MediaView: View {
             Button("Huỷ", role: .cancel) {}
         } message: { Text($0.message) }
         .onChange(of: model.tool) { model.reset() }
+        .onChange(of: model.selection) { model.refreshVideoEstimate() }
+        .onChange(of: model.videoQuality) { model.refreshVideoEstimate() }
         .onAppear { model.loadLastScan() }
     }
 
@@ -1074,8 +1107,18 @@ struct MediaView: View {
             guard !model.rows.isEmpty, model.results.isEmpty else { return "" }
             let shown = model.visibleRows.reduce(Int64(0)) { $0 + $1.size }
             let chosen = model.selectedRows.reduce(Int64(0)) { $0 + $1.size }
-            return "Đang hiện \(model.visibleRows.count)/\(model.rows.count) file, \(formatBytes(shown))."
+            var text = "Đang hiện \(model.visibleRows.count)/\(model.rows.count) file, \(formatBytes(shown))."
                 + (model.selection.isEmpty ? " Chọn file để nén hoặc xoá." : " Đã chọn \(model.selection.count) file, \(formatBytes(chosen)).")
+            if model.tool == .videos, !model.selection.isEmpty {
+                if let estimate = model.videoEstimate {
+                    let scope = estimate.counted < model.selection.count ? " (tính trên \(estimate.counted) file đầu)" : ""
+                    text += " Sau nén dự kiến còn khoảng \(formatBytes(estimate.bytes))\(scope)"
+                        + (estimate.skipped > 0 ? ", \(estimate.skipped) video đã nhẹ sẽ được giữ nguyên." : ".")
+                } else {
+                    text += " Đang ước tính dung lượng sau nén…"
+                }
+            }
+            return text
         case .organize:
             return model.plan.isEmpty ? "" : "\(model.plan.count) file sẽ được \(model.copyInsteadOfMove ? "chép" : "chuyển")."
         }

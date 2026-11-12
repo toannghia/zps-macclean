@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import VideoToolbox
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -165,34 +166,61 @@ public enum ImageCompressor {
 }
 
 public enum VideoQuality: String, CaseIterable, Identifiable, Sendable {
-    case hevcOriginal = "HEVC, giữ độ phân giải"
-    case hevc1080 = "HEVC 1080p"
-    case h264720 = "H.264 720p, tương thích rộng"
+    case balanced = "Cân bằng · 1080p HEVC (khuyên dùng)"
+    case compact = "Nhỏ gọn · 720p HEVC"
+    case high = "Chất lượng cao · giữ độ phân giải HEVC"
+    case compatible = "Tương thích · 1080p H.264"
     public var id: String { rawValue }
 
-    var preset: String {
+    /// Cạnh ngắn tối đa của khung hình; nil là giữ nguyên. Không bao giờ phóng to video.
+    var maxShortSide: Int? {
         switch self {
-        case .hevcOriginal: return AVAssetExportPresetHEVCHighestQuality
-        case .hevc1080: return AVAssetExportPresetHEVC1920x1080
-        case .h264720: return AVAssetExportPreset1280x720
+        case .balanced, .compatible: return 1080
+        case .compact: return 720
+        case .high: return nil
         }
+    }
+
+    var codec: AVVideoCodecType { self == .compatible ? .h264 : .hevc }
+
+    /// Bitrate hình mục tiêu, theo mức các nền tảng video dùng cho HEVC; H.264 cần gần gấp đôi cho cùng chất lượng.
+    public func bitrate(shortSide: Int, frameRate: Double) -> Int {
+        let base: Double
+        switch shortSide {
+        case ..<540: base = 1_000_000
+        case ..<800: base = 2_000_000
+        case ..<1200: base = 4_000_000
+        case ..<1600: base = 8_000_000
+        default: base = 16_000_000
+        }
+        var rate = base * (frameRate > 40 ? 1.5 : 1)
+        if self == .high { rate *= 1.5 }
+        if codec == .h264 { rate *= 2 }
+        return Int(rate)
     }
 }
 
-/// Nén video bằng bộ mã hoá có sẵn của macOS, dùng được phần cứng của máy.
+/// Nén video theo bitrate mục tiêu bằng bộ mã hoá phần cứng của Mac. Các mức nén có sẵn của Apple giữ
+/// bitrate rất cao nên gần như không nhỏ đi; đặt bitrate như các nền tảng video mới giảm được nhiều lần.
 public final class VideoCompressor: @unchecked Sendable {
     private let lock = NSLock()
-    private var session: AVAssetExportSession?
     private var cancelled = false
+    private var reader: AVAssetReader?
 
     public init() {}
 
     public func cancel() {
         lock.lock()
         cancelled = true
-        let current = session
+        let current = reader
         lock.unlock()
-        current?.cancelExport()
+        current?.cancelReading()
+    }
+
+    private var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
     }
 
     public func compress(_ file: MediaFile, quality: VideoQuality, replaceOriginal: Bool, root: URL,
@@ -206,67 +234,218 @@ public final class VideoCompressor: @unchecked Sendable {
         }
     }
 
+    /// Thông số sẽ dùng để nén, tính được trước để ước lượng dung lượng.
+    public struct Plan: Sendable {
+        public let width: Int
+        public let height: Int
+        public let bitrate: Int
+        public let duration: Double
+        public let sourceBitrate: Double
+        public let isHDR: Bool
+
+        /// Dung lượng dự kiến gồm hình và tiếng AAC 128 kbps.
+        public var estimatedBytes: Int64 { Int64((Double(bitrate) + 128_000) / 8 * duration) }
+    }
+
+    public static func plan(for url: URL, quality: VideoQuality) async throws -> Plan {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw MediaError.unsupported("File không có hình")
+        }
+        let (natural, frameRate, dataRate, formats) = try await track.load(.naturalSize, .nominalFrameRate,
+                                                                            .estimatedDataRate, .formatDescriptions)
+        let duration = try await asset.load(.duration).seconds
+        let sourceWidth = Int(abs(natural.width)), sourceHeight = Int(abs(natural.height))
+        guard sourceWidth > 0, sourceHeight > 0 else { throw MediaError.unreadable }
+        let short = min(sourceWidth, sourceHeight)
+        let scale = quality.maxShortSide.map { min(1, Double($0) / Double(short)) } ?? 1
+        // Bộ mã hoá cần kích thước chẵn.
+        func even(_ value: Double) -> Int { max(2, Int(value / 2) * 2) }
+        let width = even(Double(sourceWidth) * scale), height = even(Double(sourceHeight) * scale)
+        let transfer = formats.first.flatMap {
+            CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        }
+        let isHDR = transfer == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+            || transfer == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        return Plan(width: width, height: height,
+                    bitrate: quality.bitrate(shortSide: min(width, height), frameRate: Double(frameRate)),
+                    duration: duration, sourceBitrate: Double(dataRate), isHDR: isHDR)
+    }
+
     private func perform(_ file: MediaFile, quality: VideoQuality, replaceOriginal: Bool, root: URL,
                          progress: @escaping @Sendable (Double) -> Void) async throws -> CompressionResult {
-        let asset = AVURLAsset(url: file.url)
-        guard try await asset.load(.isExportable) else { throw MediaError.unsupported("Video không xuất lại được") }
-        guard let export = AVAssetExportSession(asset: asset, presetName: quality.preset) else {
-            throw MediaError.unsupported("Video không hợp với chất lượng đã chọn")
+        if isCancelled { throw MediaError.failed("Đã huỷ") }
+        let plan = try await Self.plan(for: file.url, quality: quality)
+        // Nén lại một video vốn đã nhẹ chỉ làm giảm chất lượng mà gần như không tiết kiệm được gì.
+        if plan.sourceBitrate > 0, Double(plan.bitrate) > plan.sourceBitrate * 0.7 {
+            throw MediaError.unsupported("Video đã ở bitrate thấp (\(Int(plan.sourceBitrate / 1_000_000)) Mbps), nén thêm không nhỏ đi đáng kể")
         }
-        let isMP4 = ["mp4", "m4v"].contains(file.url.pathExtension.lowercased())
-        let type: AVFileType = isMP4 && export.supportedFileTypes.contains(.mp4) ? .mp4 : .mov
-        let newExtension = type == .mp4 ? "mp4" : "mov"
-        let finalOutput = replaceOriginal ? file.url : MediaFiles.outputURL(for: file.url, root: root,
-                                                                            newExtension: newExtension)
-        try FileManager.default.createDirectory(at: finalOutput.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
-        let temp = finalOutput.deletingLastPathComponent().appendingPathComponent(".zps-\(UUID().uuidString).\(newExtension)")
-        export.outputURL = temp
-        export.outputFileType = type
-        export.shouldOptimizeForNetworkUse = true
-        // Giữ ngày quay và vị trí để video vẫn đúng chỗ trong thư viện ảnh.
-        export.metadata = try await asset.load(.metadata)
+
+        let asset = AVURLAsset(url: file.url)
+        let videoTrack = try await asset.loadTracks(withMediaType: .video).first!
+        let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
+        let (transform, frameRate) = try await videoTrack.load(.preferredTransform, .nominalFrameRate)
+        let duration = plan.duration
+
+        let finalOutput = replaceOriginal ? file.url
+            : MediaFiles.outputURL(for: file.url, root: root, newExtension: "mp4")
+        try FileManager.default.createDirectory(at: finalOutput.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let temp = finalOutput.deletingLastPathComponent().appendingPathComponent(".zps-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let reader = try AVAssetReader(asset: asset)
+        // Video HDR được giữ 10 bit để màu không bị bạc; video thường dùng 8 bit cho nhẹ.
+        let pixelFormat = plan.isHDR ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                                     : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+        ])
+        videoOutput.alwaysCopiesSampleData = false
+        reader.add(videoOutput)
+
+        let writer = try AVAssetWriter(outputURL: temp, fileType: .mp4)
+        writer.shouldOptimizeForNetworkUse = true
+        // Giữ ngày quay, vị trí và tên thiết bị.
+        writer.metadata = (try? await asset.load(.metadata)) ?? []
+
+        var compression: [String: Any] = [
+            AVVideoAverageBitRateKey: plan.bitrate,
+            AVVideoExpectedSourceFrameRateKey: max(1, Double(frameRate)),
+            AVVideoMaxKeyFrameIntervalDurationKey: 2,
+            AVVideoAllowFrameReorderingKey: true,
+        ]
+        var videoSettings: [String: Any] = [
+            AVVideoCodecKey: plan.isHDR ? AVVideoCodecType.hevc : quality.codec,
+            AVVideoWidthKey: plan.width,
+            AVVideoHeightKey: plan.height,
+            AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
+        ]
+        if plan.isHDR {
+            compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+            let formats = try await videoTrack.load(.formatDescriptions)
+            if let format = formats.first {
+                func value(_ key: CFString) -> Any? { CMFormatDescriptionGetExtension(format, extensionKey: key) }
+                videoSettings[AVVideoColorPropertiesKey] = [
+                    AVVideoColorPrimariesKey: value(kCMFormatDescriptionExtension_ColorPrimaries) ?? AVVideoColorPrimaries_ITU_R_2020,
+                    AVVideoTransferFunctionKey: value(kCMFormatDescriptionExtension_TransferFunction) ?? AVVideoTransferFunction_ITU_R_2100_HLG,
+                    AVVideoYCbCrMatrixKey: value(kCMFormatDescriptionExtension_YCbCrMatrix) ?? AVVideoYCbCrMatrix_ITU_R_2020,
+                ]
+            }
+        } else if quality.codec == .h264 {
+            compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
+        videoSettings[AVVideoCompressionPropertiesKey] = compression
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        videoInput.transform = transform
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else { throw MediaError.unsupported("Không tạo được luồng hình cho định dạng này") }
+        writer.add(videoInput)
+
+        var audioPair: (AVAssetReaderTrackOutput, AVAssetWriterInput)?
+        if let audioTrack {
+            let formats = try await audioTrack.load(.formatDescriptions)
+            let basic = formats.first.flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
+            let channels = min(2, max(1, Int(basic?.mChannelsPerFrame ?? 2)))
+            let sampleRate = basic.map { $0.mSampleRate > 0 ? $0.mSampleRate : 44_100 } ?? 44_100
+            var layout = AudioChannelLayout()
+            layout.mChannelLayoutTag = channels == 1 ? kAudioChannelLayoutTag_Mono : kAudioChannelLayoutTag_Stereo
+            let layoutData = Data(bytes: &layout, count: MemoryLayout<AudioChannelLayout>.size)
+            let pcm: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false,
+                AVNumberOfChannelsKey: channels, AVSampleRateKey: sampleRate, AVChannelLayoutKey: layoutData,
+            ]
+            let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: pcm)
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC, AVNumberOfChannelsKey: channels, AVSampleRateKey: sampleRate,
+                AVEncoderBitRateKey: 128_000, AVChannelLayoutKey: layoutData,
+            ])
+            audioInput.expectsMediaDataInRealTime = false
+            if reader.canAdd(audioOutput), writer.canAdd(audioInput) {
+                reader.add(audioOutput)
+                writer.add(audioInput)
+                audioPair = (audioOutput, audioInput)
+            }
+        }
 
         lock.lock()
-        if cancelled {
-            lock.unlock()
-            throw MediaError.failed("Đã huỷ")
-        }
-        session = export
+        self.reader = reader
+        let stopNow = cancelled
         lock.unlock()
         defer {
             lock.lock()
-            session = nil
+            self.reader = nil
             lock.unlock()
         }
+        if stopNow { throw MediaError.failed("Đã huỷ") }
 
-        let ticker = Task {
-            while !Task.isCancelled {
-                progress(Double(export.progress))
-                try? await Task.sleep(for: .milliseconds(300))
+        guard reader.startReading() else {
+            throw MediaError.failed(reader.error?.localizedDescription ?? "Không đọc được video")
+        }
+        guard writer.startWriting() else {
+            reader.cancelReading()
+            throw MediaError.failed(writer.error?.localizedDescription ?? "Không ghi được video")
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        // Mỗi luồng hình và tiếng được bơm trên hàng đợi riêng, chỉ khi bộ mã hoá sẵn sàng nhận thêm.
+        let group = DispatchGroup()
+        func pump(_ output: AVAssetReaderTrackOutput, into input: AVAssetWriterInput, label: String, reportsProgress: Bool) {
+            group.enter()
+            let queue = DispatchQueue(label: "vn.zenpos.macclean.\(label)")
+            var finished = false
+            input.requestMediaDataWhenReady(on: queue) {
+                while input.isReadyForMoreMediaData, !finished {
+                    guard let sample = output.copyNextSampleBuffer() else {
+                        finished = true
+                        input.markAsFinished()
+                        group.leave()
+                        return
+                    }
+                    if reportsProgress, duration > 0 {
+                        progress(min(0.99, CMSampleBufferGetPresentationTimeStamp(sample).seconds / duration))
+                    }
+                    if !input.append(sample) {
+                        finished = true
+                        reader.cancelReading()
+                        input.markAsFinished()
+                        group.leave()
+                        return
+                    }
+                }
             }
         }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            export.exportAsynchronously { continuation.resume() }
+        pump(videoOutput, into: videoInput, label: "video", reportsProgress: true)
+        if let (audioOutput, audioInput) = audioPair {
+            pump(audioOutput, into: audioInput, label: "audio", reportsProgress: false)
         }
-        ticker.cancel()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            group.notify(queue: .global()) { continuation.resume() }
+        }
 
-        guard export.status == .completed else {
-            try? FileManager.default.removeItem(at: temp)
-            if export.status == .cancelled { throw MediaError.failed("Đã huỷ") }
-            throw MediaError.failed(export.error?.localizedDescription ?? "Nén video thất bại")
+        if isCancelled || reader.status == .cancelled {
+            writer.cancelWriting()
+            throw MediaError.failed("Đã huỷ")
+        }
+        if reader.status == .failed || writer.status == .failed {
+            writer.cancelWriting()
+            throw MediaError.failed(reader.error?.localizedDescription ?? writer.error?.localizedDescription ?? "Nén video thất bại")
+        }
+        await writer.finishWriting()
+        guard writer.status == .completed else {
+            throw MediaError.failed(writer.error?.localizedDescription ?? "Nén video thất bại")
         }
         progress(1)
+
         let after = Int64((try? temp.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
         guard after > 0, Double(after) < Double(file.size) * (1 - minimumSaving) else {
-            try? FileManager.default.removeItem(at: temp)
             return CompressionResult(source: file.url, output: nil, before: file.size, after: file.size,
                                      skipped: "Bản nén không nhỏ hơn đáng kể, giữ bản gốc")
         }
         MediaFiles.copyDates(from: file.url, to: temp)
         let output: URL
         if replaceOriginal {
-            output = try MacCleanCore.replaceOriginal(file.url, with: temp, newExtension: newExtension)
+            output = try MacCleanCore.replaceOriginal(file.url, with: temp, newExtension: "mp4")
         } else {
             output = MediaFiles.uniqueURL(finalOutput)
             try FileManager.default.moveItem(at: temp, to: output)
